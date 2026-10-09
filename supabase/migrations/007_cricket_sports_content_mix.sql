@@ -16,6 +16,17 @@
 --
 -- `archetype` already existed on `topics` (added in migration 002) — this
 -- only adds the columns that did NOT already exist.
+--
+-- FIX (this version): section 5 originally did
+--     INSERT INTO settings (key, value)
+--     SELECT 'auto_topic_personas', 'cricket_and_sports'
+--     WHERE NOT EXISTS (...) OR (SELECT value FROM settings WHERE key = '...') = ''
+-- The OR branch meant the INSERT still ran even when the row already
+-- existed (with value = '', which migration 003 sets), so it hit the
+-- primary key on settings.key and the whole script got rolled back. It's
+-- now a single INSERT ... ON CONFLICT upsert that only overwrites an
+-- empty/missing value — same intent, no duplicate-key error, and a value
+-- you've since typed into Settings yourself is still left alone.
 -- ============================================================================
 
 
@@ -101,14 +112,18 @@ WHERE NOT EXISTS (SELECT 1 FROM settings WHERE settings.key = v.key);
 -- would stop silently blocking other personas. This app has exactly one
 -- persona, so setting it explicitly here is correct (not the same mistake —
 -- there is no second persona for this value to block).
+--
+-- Single upsert instead of a plain guarded INSERT: if the row already
+-- exists with value = '' (which migration 003 leaves it as), a bare INSERT
+-- would still attempt to insert and collide with the settings primary key.
+-- ON CONFLICT lets us update in that exact case while still leaving a
+-- value you've since typed into Settings yourself untouched.
 
 INSERT INTO settings (key, value)
-SELECT 'auto_topic_personas', 'cricket_and_sports'
-WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = 'auto_topic_personas')
-   OR (SELECT value FROM settings WHERE key = 'auto_topic_personas') = '';
-
-UPDATE settings SET value = 'cricket_and_sports'
-WHERE key = 'auto_topic_personas' AND value = '';
+VALUES ('auto_topic_personas', 'cricket_and_sports')
+ON CONFLICT (key) DO UPDATE
+    SET value = EXCLUDED.value
+    WHERE settings.value = '' OR settings.value IS NULL;
 
 -- The default catchall channel seeded in migration 002 carried the old
 -- 10-archetype v19 category list and no persona. Re-point it at this app's

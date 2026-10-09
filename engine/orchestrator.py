@@ -274,6 +274,23 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
         # A manual, targeted run: "generate for THIS channel/persona only,"
         # not whatever the shuffled full pool happens to land on.
         topics_query = topics_query.eq("persona_key", persona_key_filter)
+    else:
+        # No persona explicitly requested — this is the path every
+        # SCHEDULED (cron) run takes, with no --persona flag. Without a
+        # filter here this pulls from literally every is_active topic
+        # in the table, including old demo/leftover topics that predate
+        # this project's personas and were never assigned one (schema.sql's
+        # 5 seeded tech topics being the known example — persona_key IS
+        # NULL, is_active TRUE, never cleaned up by any migration). A
+        # persona-less topic has no channel that is actually supposed to
+        # use it, so it must never be eligible for an unscoped run.
+        active_personas = sorted({
+            c.get("persona_key") for c in
+            (db.table("channels").select("persona_key").eq("is_enabled", True).execute().data or [])
+            if c.get("persona_key")
+        })
+        if active_personas:
+            topics_query = topics_query.in_("persona_key", active_personas)
     if topic_id:
         # The most targeted case: one exact topic, chosen by hand in the
         # dashboard rather than left to the pool. persona_key_filter is
