@@ -259,6 +259,36 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
                       f"this is usually temporary — retrying in {wait}s...")
                 time.sleep(wait)
                 continue
+
+            if code in RETRYABLE_CODES:
+                # All MAX_RETRIES attempts against Gemini itself are used up
+                # and it's still returning 503/500. This is a sustained
+                # outage/overload rather than the few-second blip the retry
+                # loop above is built for. Rather than fail the whole video,
+                # fall through to the same free backup chain used for a
+                # 429 daily-quota error (Groq, then GitHub Models) — so a
+                # bad few minutes on Gemini's end no longer needs a manual
+                # retry click in the Video Queue.
+                if llm_router.any_backup_available():
+                    print(f"[script_generator] Gemini kept returning {code} after "
+                          f"{MAX_RETRIES} attempts. Trying configured backup providers...")
+                    try:
+                        text, provider_name = llm_router.call(system_prompt, user_prompt, temperature)
+                        print(f"[script_generator] \u2713 Backup provider '{provider_name}' answered. "
+                              f"This result is tagged '{provider_name}', not 'gemini', wherever it is saved.")
+                        return _ModelResponse(text, provider_name)
+                    except Exception as backup_err:
+                        raise RuntimeError(
+                            f"Gemini returned {code} on every attempt ({MAX_RETRIES} retries), and every "
+                            f"configured backup provider also failed:\n{backup_err}\n\n"
+                            f"Original Gemini error: {e}"
+                        ) from backup_err
+                raise RuntimeError(
+                    f"Gemini returned {code} on every attempt ({MAX_RETRIES} retries) and no backup "
+                    f"provider is configured. See docs/13_BACKUP_AI_PROVIDER.md to add one (free Groq "
+                    f"key, ~2 minutes) so a busy spell on Gemini's end doesn't need a manual retry.\n\n"
+                    f"Original error: {e}"
+                ) from e
             raise
     raise last_error
 
