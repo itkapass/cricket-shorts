@@ -1,0 +1,371 @@
+// src/pages/ChannelsPage.jsx
+//
+// Manage YouTube channels and which content categories route to each one.
+//
+// DESIGN NOTE — NO CREDENTIALS ARE ENTERED HERE, ON PURPOSE.
+// A channel row stores the SUFFIX of the environment variables that hold its
+// OAuth secrets, never the secrets themselves. Those live only in GitHub
+// Secrets. This page is served over the public internet from Vercel, so any
+// credential typed into it would be one XSS or one misconfigured RLS policy
+// away from being someone else's. Storing a variable NAME has no such risk.
+//
+// QUOTA NOTE shown in the UI: YouTube's 10,000-unit daily budget is per Google
+// Cloud PROJECT, not per channel. videos.insert has cost 1 unit (not the old
+// 1,600) since Dec 2025, inside its own ~100-unit/day bucket — quota is not
+// the real ceiling any more. What actually gates a channel is (1) a brand
+// new, unverified Google Cloud OAuth project forcing every upload PRIVATE
+// until Google's one-time audit passes, and (2) YouTube's own spam/quality
+// review watching posting cadence on a young channel. daily_cap (see
+// engine/channels.py -> daily_cap_for()) is set with those two in mind, not
+// the raw quota number. This app is single-channel by design, so env_suffix
+// mainly matters if you ever add a second channel with its own OAuth app.
+
+import { useEffect, useState } from 'react'
+import { Plus, Trash2, Save, AlertTriangle, Radio, Hand } from 'lucide-react'
+import { supabase, isSupabaseConfigured } from '../lib/supabase'
+import { PERSONAS, PERSONAS_ONLY, PERSONAS_META } from '../lib/personas'
+import { VOICES, RENDER_STYLES } from '../lib/mediaOptions'
+
+// Mirrors engine/sports_catalog.py's CATEGORIES dict — every topic carries
+// one of these, not the old generic persona-style categories (myth_busting,
+// dark_humour, etc.) that the app this was forked from used. Keep this list
+// in sync with that one by hand, the same way lib/personas.js stays in sync
+// with engine/personas.py (see that file's own comment for why this can't
+// be imported directly across the Python/JS boundary).
+const CATEGORIES = [
+  { key: 'rules',               label: 'Laws & Rules' },
+  { key: 'records_stats',       label: 'Records & Stats' },
+  { key: 'player_story',        label: 'Player Life Stories' },
+  { key: 'current_players',     label: 'Current Players On The Rise' },
+  { key: 'where_are_they_now',  label: 'Where Are They Now' },
+  { key: 'unsung_history',      label: 'Unnoticed Achievements' },
+  { key: 'team_history',        label: 'Team & Country Histories' },
+  { key: 'world_cup',           label: 'World Cup History' },
+  { key: 'ipl',                 label: 'IPL & Leagues' },
+  { key: 'governance_business', label: 'Boards, Governance & Money' },
+  { key: 'technology',          label: 'Cricket Technology' },
+  { key: 'iconic_matches',      label: 'Iconic Matches To Watch' },
+  { key: 'controversies',       label: 'Controversies, Factually' },
+  { key: 'training_science',    label: 'Training, Fitness & Analytics' },
+  { key: 'womens_cricket',      label: "Women's Cricket" },
+  { key: 'domestic_cricket',    label: 'Domestic Cricket' },
+  { key: 'weather_pitch',       label: 'Pitches, Weather & Conditions' },
+  { key: 'trivia_quiz',         label: 'Did You Know / Trivia' },
+  { key: 'commentary',          label: 'Iconic Commentary & Moments' },
+  { key: 'global_reach',        label: 'Cricket In Unusual Places' },
+]
+
+
+const BLANK = {
+  name: '', handle: '', persona_key: '', additional_persona_keys: [], categories: [], publish_mode: 'manual',
+  voice_override: null, render_style_override: null,
+  env_suffix: '', daily_cap: 5, priority: 100, is_catchall: false,
+  is_enabled: true, notes: '',
+}
+
+export default function ChannelsPage() {
+  const [channels, setChannels] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [draft, setDraft] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => { load() }, [])
+
+  async function load() {
+    if (!isSupabaseConfigured) { setLoading(false); return }
+    setLoading(true)
+    const { data, error } = await supabase.from('channels').select('*').order('priority')
+    if (error) setError(error.message)
+    setChannels(data || [])
+    setLoading(false)
+  }
+
+  async function save(channel) {
+    setSaving(true); setError('')
+    const payload = { ...channel }
+    delete payload.created_at
+    const { error } = channel.id
+      ? await supabase.from('channels').update(payload).eq('id', channel.id)
+      : await supabase.from('channels').insert(payload)
+    if (error) setError(error.message)
+    setSaving(false); setDraft(null); load()
+  }
+
+  async function remove(id) {
+    if (!confirm('Delete this channel? Videos already published to it are unaffected.')) return
+    await supabase.from('channels').delete().eq('id', id)
+    load()
+  }
+
+  function toggleCategory(channel, key, setter) {
+    const has = (channel.categories || []).includes(key)
+    setter({
+      ...channel,
+      categories: has
+        ? channel.categories.filter(c => c !== key)
+        : [...(channel.categories || []), key],
+    })
+  }
+
+  const autoChannels = channels.filter(c => c.publish_mode === 'auto' && c.is_enabled)
+  const suffixes = new Set(autoChannels.map(c => (c.env_suffix || '').trim()))
+  const sharedProject = autoChannels.length > 1 && suffixes.size < autoChannels.length
+
+  if (!isSupabaseConfigured) {
+    return <div className="page"><h1>Channels</h1>
+      <p className="muted">Connect Supabase to manage channels.</p></div>
+  }
+
+  return (
+    <div className="page">
+      <header className="page-head">
+        <div>
+          <h1>Channels</h1>
+          <p className="muted">
+            Where each kind of video gets posted. Add as many channels as you want.
+          </p>
+        </div>
+        <button className="btn primary" onClick={() => setDraft({ ...BLANK })}>
+          <Plus size={16} /> Add channel
+        </button>
+      </header>
+
+      {error && <div className="alert error">{error}</div>}
+
+      {sharedProject && (
+        <div className="alert warn">
+          <AlertTriangle size={16} />
+          <div>
+            <strong>Two auto-publish channels share the same credentials.</strong>
+            <p>
+              YouTube's daily upload budget is per Google Cloud project, not per channel.
+              Channels sharing one project share about 6 uploads a day between them.
+              Give each channel its own project and its own environment-variable suffix
+              to get a full budget each. See docs/07 section 5.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {loading ? <p className="muted">Loading…</p> : (
+        <div className="card-grid">
+          {channels.map(ch => (
+            <ChannelCard
+              key={ch.id}
+              channel={ch}
+              onEdit={() => setDraft({ ...ch })}
+              onDelete={() => remove(ch.id)}
+            />
+          ))}
+          {channels.length === 0 && (
+            <p className="muted">No channels yet. Add one to start routing videos.</p>
+          )}
+        </div>
+      )}
+
+      {draft && (
+        <div className="modal-backdrop" onClick={() => setDraft(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <h2>{draft.id ? 'Edit channel' : 'New channel'}</h2>
+
+            <label>Content persona <span className="muted">(optional — picks your channel's whole domain)</span>
+              <select value={draft.persona_key || ''}
+                      onChange={e => {
+                        const key = e.target.value
+                        const preset = PERSONAS_META[key]
+                        setDraft({
+                          ...draft,
+                          persona_key: key,
+                          // Auto-fill categories from the persona's preferred
+                          // formats so the routing "just works" — still
+                          // editable afterwards if you want something narrower.
+                          categories: preset ? preset.categories : draft.categories,
+                        })
+                      }}>
+                {PERSONAS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+              </select>
+            </label>
+            {draft.persona_key && PERSONAS_META[draft.persona_key] && (
+              <p className="hint">
+                {PERSONAS_META[draft.persona_key].description} The app will keep inventing new,
+                specific topics inside this domain on its own as its topic pool runs low — you
+                do not need to type them in one at a time.
+              </p>
+            )}
+
+            <label>
+              Additional personas <span className="muted">(optional — a broad channel can pull from several at once)</span>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+                {PERSONAS_ONLY.filter(([key]) => key !== draft.persona_key).map(([key, label]) => {
+                  const on = (draft.additional_persona_keys || []).includes(key)
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      className={`chip${on ? ' on' : ''}`}
+                      onClick={() => {
+                        const current = draft.additional_persona_keys || []
+                        setDraft({
+                          ...draft,
+                          additional_persona_keys: on
+                            ? current.filter(k => k !== key)
+                            : [...current, key],
+                        })
+                      }}
+                    >
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
+              <p className="hint">
+                Each one picked here gets its own topics invented automatically too — a channel
+                with 3 personas selected effectively becomes 3 domains publishing to one place.
+                Costs 1 extra Gemini request per persona per topic top-up, same as any other
+                channel with that persona attached.
+              </p>
+            </label>
+
+            <label>Channel name
+              <input value={draft.name}
+                     onChange={e => setDraft({ ...draft, name: e.target.value })}
+                     placeholder="Science Shorts" />
+            </label>
+
+            <label>Handle <span className="muted">(optional)</span>
+              <input value={draft.handle || ''}
+                     onChange={e => setDraft({ ...draft, handle: e.target.value })}
+                     placeholder="@scienceshorts" />
+            </label>
+
+            <label>Publishing
+              <select value={draft.publish_mode}
+                      onChange={e => setDraft({ ...draft, publish_mode: e.target.value })}>
+                <option value="manual">Manual — package it and I'll post it myself</option>
+                <option value="auto">Automatic — publish straight to YouTube</option>
+              </select>
+            </label>
+
+            {draft.publish_mode === 'auto' && (
+              <>
+                <label>Secret name suffix
+                  <input value={draft.env_suffix || ''}
+                         onChange={e => setDraft({
+                           ...draft,
+                           env_suffix: e.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, ''),
+                         })}
+                         placeholder="SCIENCE" />
+                </label>
+                <p className="hint">
+                  This channel will read its credentials from{' '}
+                  <code>YOUTUBE_CLIENT_ID{draft.env_suffix ? '_' + draft.env_suffix : ''}</code>,{' '}
+                  <code>YOUTUBE_CLIENT_SECRET{draft.env_suffix ? '_' + draft.env_suffix : ''}</code>{' '}
+                  and{' '}
+                  <code>YOUTUBE_REFRESH_TOKEN{draft.env_suffix ? '_' + draft.env_suffix : ''}</code>{' '}
+                  in GitHub Secrets. Leave the suffix empty to use the unsuffixed names.
+                  Credentials are never stored in this database.
+                </p>
+
+                <label>Uploads per day
+                  <input type="number" min="1" max="6" value={draft.daily_cap}
+                         onChange={e => setDraft({ ...draft, daily_cap: Number(e.target.value) })} />
+                </label>
+                <p className="hint">
+                  Keep this at 5 or below. YouTube allows 10,000 API units per project per
+                  day and each upload costs 1,600, so 6 is the hard ceiling — 5 leaves room
+                  for a retry.
+                </p>
+              </>
+            )}
+
+            <fieldset>
+              <legend>Content categories this channel accepts</legend>
+              <div className="chip-grid">
+                {CATEGORIES.map(c => (
+                  <button key={c.key} type="button"
+                          className={`chip${(draft.categories || []).includes(c.key) ? ' on' : ''}`}
+                          onClick={() => toggleCategory(draft, c.key, setDraft)}>
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+
+            <label>
+              Voice for this channel <span className="muted">(optional override)</span>
+              <select value={draft.voice_override || ''}
+                      onChange={e => setDraft({ ...draft, voice_override: e.target.value || null })}>
+                {VOICES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+              </select>
+            </label>
+
+            <label>
+              Visual style for this channel <span className="muted">(optional override)</span>
+              <select value={draft.render_style_override || ''}
+                      onChange={e => setDraft({ ...draft, render_style_override: e.target.value || null })}>
+                {RENDER_STYLES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+              </select>
+              <p className="hint">
+                Example: a health/biology channel usually reads better as Whiteboard Sketch than
+                stock footage — a diagram explains "what a stroke does" far better than a generic
+                clip ever could. Leave blank to let each persona/archetype pick its own default.
+              </p>
+            </label>
+
+            <label className="row">
+              <input type="checkbox" checked={!!draft.is_catchall}
+                     onChange={e => setDraft({ ...draft, is_catchall: e.target.checked })} />
+              Catch-all — also receive videos no other channel claimed
+            </label>
+
+            <label className="row">
+              <input type="checkbox" checked={!!draft.is_enabled}
+                     onChange={e => setDraft({ ...draft, is_enabled: e.target.checked })} />
+              Enabled
+            </label>
+
+            <div className="modal-actions">
+              <button className="btn" onClick={() => setDraft(null)}>Cancel</button>
+              <button className="btn primary" disabled={saving || !draft.name}
+                      onClick={() => save(draft)}>
+                <Save size={16} /> {saving ? 'Saving…' : 'Save channel'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ChannelCard({ channel, onEdit, onDelete }) {
+  const auto = channel.publish_mode === 'auto'
+  return (
+    <div className={`card${channel.is_enabled ? '' : ' dim'}`}>
+      <div className="card-head">
+        <h3>{channel.name}</h3>
+        <span className={`pill ${auto ? 'pill-green' : 'pill-amber'}`}>
+          {auto ? <Radio size={12} /> : <Hand size={12} />} {auto ? 'Auto' : 'Manual'}
+        </span>
+      </div>
+      {channel.handle && <p className="muted">{channel.handle}</p>}
+      <div className="chip-row">
+        {(channel.categories || []).map(c => (
+          <span key={c} className="chip sm on">
+            {CATEGORIES.find(x => x.key === c)?.label || c}
+          </span>
+        ))}
+        {channel.is_catchall && <span className="chip sm">catch-all</span>}
+      </div>
+      <p className="muted small">
+        {auto ? `Up to ${channel.daily_cap}/day` : 'Packaged for manual posting'}
+        {channel.env_suffix ? ` · secrets: *_${channel.env_suffix}` : ''}
+      </p>
+      <div className="card-actions">
+        <button className="btn sm" onClick={onEdit}>Edit</button>
+        <button className="btn sm danger" onClick={onDelete}><Trash2 size={14} /></button>
+      </div>
+    </div>
+  )
+}

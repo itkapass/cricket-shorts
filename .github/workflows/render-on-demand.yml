@@ -1,0 +1,153 @@
+name: Render On-Demand Video
+
+# Renders ONE specific job_id that already has a storyboard saved (status
+# 'queued_for_render') — e.g. from the Admin Panel's Create Video page.
+#
+# NEW: this is what closes the "do I need my own computer running" gap.
+# Before this, the only way to render a storyboard you built in the Admin
+# Panel was to copy a command and run it on your own machine (see
+# CreateVideo.jsx's "Copy Render Command" button, still there as a
+# fallback). This workflow lets the deployed (Vercel) Admin Panel trigger
+# the same render in GitHub's cloud instead — see the "Render in Cloud"
+# button, which calls the trigger-render Edge Function, which calls this
+# workflow's dispatch API. Same compute GitHub already gives you for free
+# for the scheduled generate/publish workflows, just triggered on demand.
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'job_id of the queued_for_render video to render'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  # Lets the workflow's automatic GITHUB_TOKEN call GitHub Models — the
+  # third, zero-signup free fallback tried only if Gemini AND Groq have
+  # both already failed with a genuine daily-quota error today. See
+  # engine/github_models_provider.py and engine/llm_router.py.
+  models: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      # See generate.yml for the full explanation — same offline male-voice
+      # fallback tier, installed here too so a manually-triggered render
+      # gets the same voice reliability as a scheduled one.
+      - name: Install Piper TTS (offline male-voice fallback)
+        continue-on-error: true
+        run: |
+          mkdir -p "$HOME/.piper"
+          curl -sL -o "$HOME/.piper/piper.tar.gz" \
+            "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz"
+          if [ -s "$HOME/.piper/piper.tar.gz" ]; then
+            tar xzf "$HOME/.piper/piper.tar.gz" -C "$HOME/.piper" --strip-components=1
+          fi
+          curl -sL -o "$HOME/.piper/voice.onnx" \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/joe/medium/en_US-joe-medium.onnx"
+          curl -sL -o "$HOME/.piper/voice.onnx.json" \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/joe/medium/en_US-joe-medium.onnx.json"
+          MODEL_SIZE=$(stat -c%s "$HOME/.piper/voice.onnx" 2>/dev/null || echo 0)
+          if [ -x "$HOME/.piper/piper" ] && [ "$MODEL_SIZE" -gt 1000000 ]; then
+            echo "PIPER_MODEL_PATH=$HOME/.piper/voice.onnx" >> "$GITHUB_ENV"
+            echo "$HOME/.piper" >> "$GITHUB_PATH"
+            echo "Piper installed OK ($MODEL_SIZE bytes)."
+          else
+            echo "Piper install did not produce a usable binary+model this run \u2014 that's fine, gTTS is still there as the last resort."
+          fi
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore Whisper model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/whisper
+          key: whisper-tiny-model-v1
+
+      - name: Cache sentence-transformers model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: sentence-transformers-minilm-l6-v2-v1
+
+      - name: Render the requested job
+        env:
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          # Optional free backups when Gemini's daily quota is gone — see docs/13 and docs/14.
+          GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
+          GITHUB_TOKEN:         ${{ secrets.GITHUB_TOKEN }}  # third fallback: GitHub Models (needs the models:read permission above, no new secret)
+          HUGGINGFACE_API_KEY:  ${{ secrets.HUGGINGFACE_API_KEY }}  # optional AI-visual backup, see docs/15
+          GEMINI_MODEL:         ${{ secrets.GEMINI_MODEL }}
+          PEXELS_API_KEY:       ${{ secrets.PEXELS_API_KEY }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # Cloudflare R2 (10 GB free, no egress fees). Leave these unset and
+          # the pipeline automatically falls back to Supabase Storage (1 GB).
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+          # Alerting. Optional, but without it every failure is silent.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          SUPABASE_ANON_KEY:    ${{ secrets.SUPABASE_ANON_KEY }}
+          OUTPUT_DIR:           /tmp/shorts_output
+          ASSETS_DIR:           assets
+        run: |
+          python -m engine.orchestrator --render-job "${{ inputs.job_id }}"
+
+      - name: Retry upload if it didn't already succeed
+        if: always()
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # Cloudflare R2 (10 GB free, no egress fees). Leave these unset and
+          # the pipeline automatically falls back to Supabase Storage (1 GB).
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+          # Alerting. Optional, but without it every failure is silent.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          OUTPUT_DIR:           /tmp/shorts_output
+        run: |
+          python -m engine.storage --job-id "${{ inputs.job_id }}" || true
+
+      # Fires even if Python crashed on its very first line. The in-Python
+      # alerting in engine/alerts.py cannot report a crash that happens before
+      # engine/alerts.py is ever reached — this can.
+      - name: Alert on failure
+        if: failure()
+        uses: ./.github/actions/notify-failure
+        with:
+          workflow_name: "Render On-Demand Video"
+          telegram_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          telegram_chat: ${{ secrets.TELEGRAM_CHAT_ID }}

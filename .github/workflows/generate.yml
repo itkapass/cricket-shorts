@@ -1,0 +1,294 @@
+name: Generate Video Drafts
+
+# ─────────────────────────────────────────────────────────────────
+# WORKFLOW 2 of 6: Generate Video Drafts
+#
+# Writes ONE video and renders it, then stops. Runs 6 times a day.
+# The finished draft waits in your Video Queue until you approve it.
+# Nothing here ever touches YouTube.
+# ─────────────────────────────────────────────────────────────────
+
+on:
+  # SIX RUNS A DAY, ONE VIDEO EACH — and all six inside a single Gemini
+  # quota day.
+  #
+  # Gemini's free daily allowance resets at MIDNIGHT PACIFIC, which is
+  # 07:00 UTC. The old schedule ran every 2 hours around the clock, so the
+  # runs at 00:00, 02:00, 04:00 and 06:00 UTC were still inside Google's
+  # PREVIOUS day and were spending an allowance that was already gone.
+  # They got 429s, which pinned the internal counter to "full" for the
+  # rest of the day — so the later runs, which had a completely fresh
+  # quota available, refused to run. Zero videos, every day.
+  #
+  # These six times all sit between 01:00 and 16:00 Pacific, safely inside
+  # one quota day, starting an hour after it refills.
+  #
+  #   08:00 UTC = 01:30 PM IST      17:00 UTC = 10:30 PM IST
+  #   11:00 UTC = 04:30 PM IST      20:00 UTC = 01:30 AM IST
+  #   14:00 UTC = 07:30 PM IST      23:00 UTC = 04:30 AM IST
+  #
+  # (Generation time does not affect your audience — only PUBLISH time
+  # does, and that is a separate workflow with its own schedule.)
+  #
+  # Budget maths, against a free key's ~20 requests/day:
+  #   6 videos x 2 requests (creative brief + storyboard) = 12
+  #   1 persona x 1 request for topic top-up              =  1
+  #   -------------------------------------------------------
+  #                                                  total  13  of 20
+  # (This app is single-persona/single-channel, so there's only ever one
+  # pool to top up — a multi-channel fork would multiply this line.)
+  schedule:
+    - cron: '0 8,11,14,17,20,23 * * *'
+
+  # Manual trigger from the Actions tab. Leave "how many" blank for the
+  # normal automatic behaviour (top up toward today's target). Fill it in
+  # to generate a specific number right now regardless of the daily target
+  # — e.g. to backfill after a quiet day, or to test a change immediately.
+  # ── MANUAL "make me a video right now" ─────────────────────────────
+  # Actions tab -> Generate Video Drafts -> Run workflow. Or press the
+  # "Generate Video Now" button on the dashboard, which triggers this
+  # same thing.
+  workflow_dispatch:
+    inputs:
+      manual_count:
+        description: "How many videos to generate right now (blank = automatic)"
+        required: false
+        default: ""
+      skip_topics:
+        description: "Skip inventing new topics (saves Gemini requests)"
+        required: false
+        type: boolean
+        default: false
+      persona:
+        description: "Restrict to one persona's topics only (blank = normal behavior). This app ships with exactly one — only useful again if you add a second."
+        required: false
+        type: choice
+        default: ""
+        options:
+          - ""
+          - cricket_and_sports
+      topic_id:
+        description: "Advanced: generate exactly this one topic id (from Topic Studio), ignoring the persona filter above and any count."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  # Lets the workflow's automatic GITHUB_TOKEN call GitHub Models — the
+  # third, zero-signup free fallback tried only if Gemini AND Groq have
+  # both already failed with a genuine daily-quota error today. See
+  # engine/github_models_provider.py and engine/llm_router.py.
+  models: read
+
+jobs:
+  generate:
+    name: Generate Video Drafts
+    runs-on: ubuntu-latest
+    timeout-minutes: 90   # Safety limit: prevent runaway builds
+
+    steps:
+      # ── 1. Checkout code ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ──────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Install system dependencies (FFmpeg) ───────────────────
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      # ── Offline TTS fallback, with a REAL, working male voice ──────────
+      # WHY THIS EXISTS: edge-tts fails often enough on GitHub's shared
+      # runner IPs that the pipeline regularly falls back past it — and the
+      # fallback after Piper, gTTS, has ZERO voice selection at all (one
+      # fixed voice, structurally incapable of sounding male no matter what
+      # Settings says). Piper was already coded as the middle fallback tier
+      # but was never actually installed here, so every edge-tts failure
+      # skipped straight to gTTS's fixed voice. This installs the real
+      # binary and a real male voice model, so "documentary_male" stays
+      # true even when edge-tts has a bad day — not just most of the time.
+      #
+      # Voice: en_US-joe-medium, not the more commonly recommended
+      # en_US-ryan — Piper's own GitHub issue #128 has the maintainer
+      # confirming Ryan mumbles specific sentences due to bad training
+      # data; Joe doesn't have that problem and is an equally real male
+      # voice. Every download is size-checked — an HTML error page saved
+      # as if it were a model file is exactly the kind of silent failure
+      # that would otherwise crash mid-render instead of just skipping to
+      # gTTS the way a missing voice always safely does.
+      - name: Install Piper TTS (offline male-voice fallback)
+        continue-on-error: true  # optional tier — never block the pipeline on this
+        run: |
+          mkdir -p "$HOME/.piper"
+          curl -sL -o "$HOME/.piper/piper.tar.gz" \
+            "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz"
+          if [ -s "$HOME/.piper/piper.tar.gz" ]; then
+            tar xzf "$HOME/.piper/piper.tar.gz" -C "$HOME/.piper" --strip-components=1
+          fi
+          curl -sL -o "$HOME/.piper/voice.onnx" \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/joe/medium/en_US-joe-medium.onnx"
+          curl -sL -o "$HOME/.piper/voice.onnx.json" \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/joe/medium/en_US-joe-medium.onnx.json"
+          # A real voice model is tens of MB; an error page saved to disk
+          # is a few hundred bytes at most — this is what tells the
+          # difference between "downloaded fine" and "downloaded a 404".
+          MODEL_SIZE=$(stat -c%s "$HOME/.piper/voice.onnx" 2>/dev/null || echo 0)
+          if [ -x "$HOME/.piper/piper" ] && [ "$MODEL_SIZE" -gt 1000000 ]; then
+            echo "PIPER_MODEL_PATH=$HOME/.piper/voice.onnx" >> "$GITHUB_ENV"
+            echo "$HOME/.piper" >> "$GITHUB_PATH"
+            echo "Piper installed OK ($MODEL_SIZE bytes)."
+          else
+            echo "Piper install did not produce a usable binary+model this run \u2014 that's fine, gTTS is still there as the last resort."
+          fi
+
+      # ── 4. Install Python dependencies ────────────────────────────
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      # ── 5. Download Whisper model (cache between runs) ────────────
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/whisper
+          key: whisper-tiny-model-v1
+
+      # Caches the ~80MB sentence-embedding model used by concept_memory.py's
+      # semantic duplicate check, the same way the line above caches Whisper —
+      # without this, every single run re-downloads it from Hugging Face.
+      - name: Cache sentence-transformers model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: sentence-transformers-minilm-l6-v2-v1
+
+      # ── 6. Run the generation pipeline ────────────────────────────
+      # NOTE: storage upload now happens INSIDE this step (engine/storage.py
+      # is called directly from orchestrator.py) — it used to be a separate,
+      # unguarded step below with no error handling, which also meant it
+      # only ever ran in this workflow and never for local/Docker runs. See
+      # engine/storage.py's docstring for the full story.
+      - name: Run video generation pipeline
+        env:
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          # Optional free backups when Gemini's daily quota is gone — see docs/13 and docs/14.
+          GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
+          GITHUB_TOKEN:         ${{ secrets.GITHUB_TOKEN }}  # third fallback: GitHub Models (needs the models:read permission above, no new secret)
+          HUGGINGFACE_API_KEY:  ${{ secrets.HUGGINGFACE_API_KEY }}  # optional AI-visual backup, see docs/15
+          GEMINI_MODEL:         ${{ secrets.GEMINI_MODEL }}   # optional — leave the secret unset to use the code default
+          PEXELS_API_KEY:       ${{ secrets.PEXELS_API_KEY }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # Cloudflare R2 (10 GB free, no egress fees). Leave these unset and
+          # the pipeline automatically falls back to Supabase Storage (1 GB).
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+          # Alerting. Optional, but without it every failure is silent.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          VAPID_CLAIM_EMAIL: ${{ secrets.VAPID_CLAIM_EMAIL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          SUPABASE_ANON_KEY:    ${{ secrets.SUPABASE_ANON_KEY }}
+          OUTPUT_DIR:           /tmp/shorts_output
+          ASSETS_DIR:           assets
+        run: |
+          ARGS=""
+          # SCHEDULED runs always skip topic top-up, full stop — no exception.
+          # inputs.skip_topics is only ever populated on a manual
+          # workflow_dispatch run; on a cron trigger it evaluates to empty
+          # regardless of the input's declared default, so checking it here
+          # was silently a no-op for every one of the 6 scheduled runs a day.
+          # That meant EVERY scheduled run also re-checked and topped up
+          # every active persona's pool — with 3 channels, up to 3 extra
+          # Gemini calls, 6 times a day, on top of the 12 already budgeted
+          # for videos. The dedicated Add Topics workflow (once a day) was
+          # supposed to be the only place this cost was paid; this silently
+          # multiplied it, which is a real, measurable reason the daily
+          # allowance was running out every single day.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            ARGS="$ARGS --skip-topics"
+          elif [ "${{ inputs.skip_topics }}" = "true" ]; then
+            ARGS="$ARGS --skip-topics"
+          fi
+          if [ -n "${{ inputs.manual_count }}" ]; then
+            ARGS="$ARGS --count ${{ inputs.manual_count }}"
+          fi
+          if [ -n "${{ inputs.persona }}" ]; then
+            ARGS="$ARGS --persona ${{ inputs.persona }}"
+          fi
+          if [ -n "${{ inputs.topic_id }}" ]; then
+            ARGS="$ARGS --topic-id ${{ inputs.topic_id }}"
+          fi
+          python -m engine.orchestrator $ARGS
+
+      # ── 7. Safety net: retry-upload anything that didn't already upload ──
+      # orchestrator.py uploads each video right after rendering it (with
+      # retries — see engine/storage.py). This step just catches the rare
+      # case where a video rendered fine but the upload itself failed even
+      # after those retries, so a batch doesn't silently lose a video that
+      # only needed one more attempt.
+      - name: Retry any videos that failed to upload
+        if: always()
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # Cloudflare R2 (10 GB free, no egress fees). Leave these unset and
+          # the pipeline automatically falls back to Supabase Storage (1 GB).
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+          # Alerting. Optional, but without it every failure is silent.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          VAPID_CLAIM_EMAIL: ${{ secrets.VAPID_CLAIM_EMAIL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          OUTPUT_DIR:           /tmp/shorts_output
+        run: |
+          python -m engine.storage --all-pending
+
+      # Commit the concept ledger back to the repo. Two purposes: it is the
+      # human-readable record of every idea already used, and the commit
+      # doubles as repository activity so GitHub never disables the cron.
+      - name: Commit concept ledger
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add concepts.jsonl 2>/dev/null || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update concept ledger [skip ci]"
+            git pull --rebase --autostash origin ${GITHUB_REF_NAME} || true
+            git push
+          else
+            echo "No new concepts to record."
+          fi
+
+      # Fires even if Python crashed on its very first line. The in-Python
+      # alerting in engine/alerts.py cannot report a crash that happens before
+      # engine/alerts.py is ever reached — this can.
+      - name: Alert on failure
+        if: failure()
+        uses: ./.github/actions/notify-failure
+        with:
+          workflow_name: "Generate Video Drafts"
+          telegram_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          telegram_chat: ${{ secrets.TELEGRAM_CHAT_ID }}
