@@ -179,7 +179,40 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
                     top_p=0.95,
                 ),
             )
-            return _ModelResponse(resp.text, "gemini")
+            resp_text = resp.text
+            if not resp_text or not resp_text.strip():
+                # A blank response previously turned into a bare "Expecting
+                # value: line 1 column 1 (char 0)" with nothing under "Raw
+                # output" — true, but useless for deciding whether to retry
+                # this topic or retire it. The SDK almost always knows WHY
+                # it came back empty (safety filter, recitation match, ran
+                # out of tokens) even when there's no text; surface that
+                # instead of silence, best-effort, so the Failed card
+                # actually explains itself on this failure shape too.
+                reasons = []
+                try:
+                    for cand in (resp.candidates or []):
+                        fr = getattr(cand, "finish_reason", None)
+                        if fr:
+                            reasons.append(f"finish_reason={fr}")
+                        ratings = getattr(cand, "safety_ratings", None) or []
+                        flagged = [
+                            f"{getattr(r, 'category', '?')}={getattr(r, 'probability', '?')}"
+                            for r in ratings if getattr(r, "probability", None) not in (None, "NEGLIGIBLE", "LOW")
+                        ]
+                        if flagged:
+                            reasons.append("safety_ratings=" + ", ".join(flagged))
+                except Exception:
+                    pass
+                try:
+                    block_reason = getattr(getattr(resp, "prompt_feedback", None), "block_reason", None)
+                    if block_reason:
+                        reasons.append(f"prompt_feedback.block_reason={block_reason}")
+                except Exception:
+                    pass
+                diagnosis = "; ".join(reasons) if reasons else "no finish_reason/block_reason exposed by the SDK"
+                resp_text = f"[EMPTY RESPONSE FROM GEMINI — {diagnosis}]"
+            return _ModelResponse(resp_text, "gemini")
         except errors.APIError as e:
             last_error = e
             code = getattr(e, "code", None)
