@@ -622,9 +622,21 @@ Generate a {num_scenes}-scene storyboard adhering strictly to the JSON schema.
             # content one). A human skimming the Failed tab could not tell
             # these apart without opening the raw output and reading closely
             # every time.
-            stripped = raw.strip().lower()
+            # Normalize curly/typographic quotes (\u2018 \u2019 etc.) to a plain
+            # straight apostrophe first — Gemini and the backup providers
+            # routinely write "I\u2019m sorry" / "can\u2019t help" with a curly
+            # apostrophe, which otherwise silently fails a straight-apostrophe
+            # .startswith() check and lets a genuine refusal slip through as
+            # if it were a retryable formatting glitch.
+            stripped = (
+                raw.strip().lower()
+                .replace("\u2019", "'").replace("\u2018", "'")
+                .replace("\u02bc", "'").replace("`", "'")
+            )
             refusal_markers = ("i'm sorry", "i am sorry", "i cannot", "i can't fulfill",
-                               "i can't help with", "i won't be able to", "as an ai")
+                               "i can't help with", "i won't be able to", "as an ai",
+                               "i'm not able to", "i am not able to", "i can't assist",
+                               "i cannot assist", "i can't provide", "i cannot provide")
             looks_like_refusal = (
                 len(raw) < 300
                 and not raw.startswith(("{", "["))
