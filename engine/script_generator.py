@@ -352,9 +352,16 @@ def _build_system_prompt(render_style: str, num_scenes: int, archetype: str = No
     elif render_style == "sports_visual":
         visual_field = (
             '"visual_keyword": "The real, specific, named subject of this scene for image/footage '
-            'search — a player\'s full name, a team, a stadium, or a concrete cricket/sport action '
-            '(e.g. \'Virat Kohli batting\', \'Eden Gardens crowd\', \'fast bowler follow through '
-            'close up\'). Real, specific, named subjects find real photos; vague ideas do not.",\n      '
+            'search — a player\'s full name, a team, a stadium, or a concrete cricket/sport action. '
+            'MUST contain the sport\'s own name (\'cricket\', or the specific other sport this video '
+            'is about) UNLESS the phrase already has a named player/team/ground in it, or a term '
+            'unique to that sport (e.g. \'LBW\', \'googly\', \'powerplay\') that cannot be confused '
+            'with another sport. A bare action word like \'relay throw\', \'claims a catch\', or '
+            '\'shooting straight up\' is WRONG — it reads as generic sport and stock search will '
+            'just as easily return baseball, football or cricket for it. '
+            '(e.g. \'Virat Kohli batting\', \'Eden Gardens crowd\', \'cricket fast bowler follow '
+            'through close up\', \'cricket fielder relay throw stadium\' — never just \'relay '
+            'throw\'). Real, specific, named subjects find real photos; vague ideas do not.",\n      '
             '"scene_kind": "normal|stat|quiz — see SCENE_KIND RULES below. Omit or use \'normal\' '
             'unless this exact scene is the numeric reveal or the closing question."'
         )
@@ -369,7 +376,10 @@ def _build_system_prompt(render_style: str, num_scenes: int, archetype: str = No
             "team, tournament, or a concrete physical action — rather than an abstract idea. Real "
             "names and real objects find real photos on Wikipedia/stock sites; concepts do not. If "
             "a scene has no single findable subject, name the closest concrete action instead (e.g. "
-            "'cricket ball seam close up', not 'skill').\n"
+            "'cricket ball seam close up', not 'skill'). CROSS-SPORT MIX-UPS ARE A REAL, CONFIRMED "
+            "FAILURE MODE — a vague action keyword with no sport name in it has returned baseball "
+            "stock footage on a cricket video before. Every visual_keyword must make the sport "
+            "unambiguous on its own, without relying on the voice_text for context.\n"
             "   SCENE_KIND RULES: mark ONE scene \"stat\" — the single moment stating the core "
             "number or record this video is built on, for a distinct data-card visual. Every other "
             f"scene is \"normal\" (or omit the field).{_quiz_pointer}"
@@ -447,11 +457,24 @@ RULES:
    video". The hook has to be TRUE and be something the rest of the video
    actually delivers on — don't promise a twist you don't pay off.
 3. PACING: every scene is punchy (1-2 sentences max). Cut every unnecessary word.
-4. ENDING (scene {num_scenes}): end with a clear, honest reason to keep
-   engaging — a specific follow-up question, what part 2 will cover, or why
-   subscribing matters for THIS channel. Do not use empty engagement-bait
-   instructions like "comment X and I'll DM you" — YouTube's spam policies
-   discourage this, and it reads as hollow to viewers anyway.
+4. ENDING (scene {num_scenes}): this is NOT optional — the final scene's
+   voice_text MUST end with one short, natural sentence that does ONE of
+   these four things (rotate which one across videos, do not default to
+   the same type every time):
+     a) asks a specific follow-up question tied to THIS fact (e.g. "now
+        guess which rule costs even more runs — comment your answer")
+     b) points at a concrete part 2 ("there's an even stranger one in
+        ODIs — follow so you don't miss it")
+     c) a direct but honest subscribe/follow line tied to what this
+        channel actually offers (e.g. "follow for the cricket rule
+        nobody explains properly")
+     d) a direct share line tied to this specific fact (e.g. "send this
+        to the one friend who'll argue it's wrong")
+   Never invent the exact same sentence twice — vary the wording every
+   time. Do not use empty engagement-bait instructions like "comment X
+   and I'll DM you" — YouTube's spam policies discourage this, and it
+   reads as hollow to viewers anyway. A video that ends on the fact alone,
+   with no (a/b/c/d) line, is incomplete — do not do this.
 {visual_rule}
 6. Do not state invented statistics or claims about real, named companies or
    people as fact unless they're well-established public knowledge — a
@@ -573,43 +596,87 @@ Generate a {num_scenes}-scene storyboard adhering strictly to the JSON schema.
     print(f"[script_generator] Generating storyboard for: '{prompt[:50]}...' "
           f"(tone='{tone_name}', style='{render_style}', archetype='{archetype or 'none'}')")
 
-    response = _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature)
+    MAX_JSON_RETRIES = 2  # a truncated response is usually a one-off sampling
+                          # glitch, not a systemic problem — worth one or two
+                          # fresh tries before treating it as a real failure.
+    storyboard = None
+    last_json_error = None
+    used_provider = "gemini"
 
-    try:
-        raw = response.text.strip()
-        raw = re.sub(r"^```json\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        storyboard = json.loads(raw)
-    except json.JSONDecodeError as e:
-        # THE BUG THIS FIXES: two genuinely different situations both used
-        # to produce the identical, confusing "invalid JSON" message —
-        # Gemini plainly refusing the topic ("I'm sorry, but I can't
-        # fulfill that request.", which isn't JSON at all and never will
-        # be, no matter how you reparse it) and Gemini's response getting
-        # cut off mid-structure (a genuine truncation, worth knowing about
-        # separately since it points at a token-limit problem, not a
-        # content one). A human skimming the Failed tab could not tell
-        # these apart without opening the raw output and reading closely
-        # every time.
-        stripped = raw.strip().lower()
-        refusal_markers = ("i'm sorry", "i am sorry", "i cannot", "i can't fulfill",
-                           "i can't help with", "i won't be able to", "as an ai")
-        looks_like_refusal = (
-            len(raw) < 300
-            and not raw.startswith(("{", "["))
-            and any(stripped.startswith(m) for m in refusal_markers)
-        )
-        if looks_like_refusal:
-            raise ValueError(
-                f"Gemini declined to write this topic (not a JSON/formatting problem): "
-                f"{raw[:300]!r}\n\n"
-                f"This means something about the topic or tone combination tripped a "
-                f"content filter on Gemini's side. If this keeps happening for the same "
-                f"topic, consider retiring it in Topic Studio rather than retrying — a "
-                f"refusal is a judgment call by the model, not a transient error, and "
-                f"won't be fixed by trying again."
+    for json_attempt in range(1, MAX_JSON_RETRIES + 1):
+        response = _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature)
+        try:
+            raw = response.text.strip()
+            raw = re.sub(r"^```json\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            storyboard = json.loads(raw)
+            break
+        except json.JSONDecodeError as e:
+            # THE BUG THIS FIXES: two genuinely different situations both used
+            # to produce the identical, confusing "invalid JSON" message —
+            # Gemini plainly refusing the topic ("I'm sorry, but I can't
+            # fulfill that request.", which isn't JSON at all and never will
+            # be, no matter how you reparse it) and Gemini's response getting
+            # cut off mid-structure (a genuine truncation, worth knowing about
+            # separately since it points at a token-limit problem, not a
+            # content one). A human skimming the Failed tab could not tell
+            # these apart without opening the raw output and reading closely
+            # every time.
+            stripped = raw.strip().lower()
+            refusal_markers = ("i'm sorry", "i am sorry", "i cannot", "i can't fulfill",
+                               "i can't help with", "i won't be able to", "as an ai")
+            looks_like_refusal = (
+                len(raw) < 300
+                and not raw.startswith(("{", "["))
+                and any(stripped.startswith(m) for m in refusal_markers)
             )
-        raise ValueError(f"Gemini returned invalid JSON: {e}\nRaw output:\n{response.text[:500]}")
+            if looks_like_refusal:
+                # Retrying won't change the model's mind about the topic —
+                # fail immediately rather than burning more attempts/quota.
+                raise ValueError(
+                    f"Gemini declined to write this topic (not a JSON/formatting problem): "
+                    f"{raw[:300]!r}\n\n"
+                    f"This means something about the topic or tone combination tripped a "
+                    f"content filter on Gemini's side. If this keeps happening for the same "
+                    f"topic, consider retiring it in Topic Studio rather than retrying — a "
+                    f"refusal is a judgment call by the model, not a transient error, and "
+                    f"won't be fixed by trying again."
+                )
+            last_json_error = (e, response.text[:500])
+            if json_attempt < MAX_JSON_RETRIES:
+                print(f"[script_generator] \u26a0 Gemini's response was cut off/malformed JSON "
+                      f"(attempt {json_attempt}/{MAX_JSON_RETRIES}) — retrying fresh...")
+                continue
+
+    if storyboard is None:
+        # Exhausted the direct retries and it's still truncating — same
+        # escalation as the 503 case: try the configured backup providers
+        # before giving up completely, rather than failing the whole video
+        # over what is usually just this one provider having a bad moment.
+        if llm_router.any_backup_available():
+            print(f"[script_generator] Gemini's JSON kept coming back malformed after "
+                  f"{MAX_JSON_RETRIES} attempts. Trying configured backup providers...")
+            try:
+                backup_text, used_provider = llm_router.call(system_prompt, user_prompt, temperature)
+                backup_text = backup_text.strip()
+                backup_text = re.sub(r"^```json\s*", "", backup_text)
+                backup_text = re.sub(r"\s*```$", "", backup_text)
+                storyboard = json.loads(backup_text)
+                print(f"[script_generator] \u2713 Backup provider '{used_provider}' returned valid JSON.")
+            except Exception as backup_err:
+                e, raw_snippet = last_json_error
+                raise ValueError(
+                    f"Gemini returned malformed JSON on every attempt ({MAX_JSON_RETRIES} retries), "
+                    f"and every configured backup provider also failed:\n{backup_err}\n\n"
+                    f"Original error: {e}\nRaw output:\n{raw_snippet}"
+                ) from backup_err
+        else:
+            e, raw_snippet = last_json_error
+            raise ValueError(
+                f"Gemini returned invalid JSON on every attempt ({MAX_JSON_RETRIES} retries) and no "
+                f"backup provider is configured. See docs/13_BACKUP_AI_PROVIDER.md to add one (free "
+                f"Groq key, ~2 minutes).\n\nOriginal error: {e}\nRaw output:\n{raw_snippet}"
+            ) from e
 
     # ── Validate top-level keys ────────────────────────────────────────────
     for key in ["video_title", "description", "hashtags", "scenes"]:
