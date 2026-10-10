@@ -622,25 +622,34 @@ Generate a {num_scenes}-scene storyboard adhering strictly to the JSON schema.
             # content one). A human skimming the Failed tab could not tell
             # these apart without opening the raw output and reading closely
             # every time.
-            # Normalize curly/typographic quotes (\u2018 \u2019 etc.) to a plain
-            # straight apostrophe first — Gemini and the backup providers
-            # routinely write "I\u2019m sorry" / "can\u2019t help" with a curly
-            # apostrophe, which otherwise silently fails a straight-apostrophe
-            # .startswith() check and lets a genuine refusal slip through as
-            # if it were a retryable formatting glitch.
+            # Normalize curly/typographic quotes AND strip invisible leading
+            # characters (BOM, zero-width space, stray markdown/quote marks)
+            # before matching. A straight startswith() check on the raw text
+            # is too fragile for this — it already missed a real refusal
+            # once because of a curly apostrophe, and a BOM, a leading
+            # quote mark, or Gemini opening with "Sorry," instead of "I'm
+            # sorry," would each silently defeat it the same way. Checking
+            # for these phrases ANYWHERE in the first ~80 characters, after
+            # stripping junk, is far more robust than requiring an exact
+            # prefix match.
             stripped = (
                 raw.strip().lower()
                 .replace("\u2019", "'").replace("\u2018", "'")
                 .replace("\u02bc", "'").replace("`", "'")
+                .lstrip("\ufeff\u200b\u200c\u200d \"'\u201c\u201d*-\n\t")
             )
-            refusal_markers = ("i'm sorry", "i am sorry", "i cannot", "i can't fulfill",
-                               "i can't help with", "i won't be able to", "as an ai",
+            opening = stripped[:80]
+            refusal_markers = ("i'm sorry", "i am sorry", "sorry, but i", "sorry but i",
+                               "i cannot", "i can't fulfill", "i can't help with",
+                               "i cannot help with", "i won't be able to", "as an ai",
                                "i'm not able to", "i am not able to", "i can't assist",
-                               "i cannot assist", "i can't provide", "i cannot provide")
+                               "i cannot assist", "i can't provide", "i cannot provide",
+                               "i'm unable to", "i am unable to", "unable to help with",
+                               "not something i can help with")
             looks_like_refusal = (
                 len(raw) < 300
-                and not raw.startswith(("{", "["))
-                and any(stripped.startswith(m) for m in refusal_markers)
+                and not raw.lstrip().startswith(("{", "["))
+                and any(m in opening for m in refusal_markers)
             )
             if looks_like_refusal:
                 # Retrying won't change the model's mind about the topic —
