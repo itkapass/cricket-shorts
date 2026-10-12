@@ -52,7 +52,7 @@ if __package__ in (None, ""):
 
 from engine.config import require, get
 from engine.script_generator import generate_storyboard, generate_custom_storyboard
-from engine.voice_engine import generate_voiceover, get_scene_timestamps
+from engine.voice_engine import generate_voiceover, get_scene_timestamps, voice_profile_for_tone
 from engine.visual_fetcher import fetch_all_scene_clips, fetch_all_scene_clips_sports
 from engine.subtitle_engine import build_caption_cards, CaptionStyle, export_srt
 from engine.audio_mixer import mix_audio
@@ -274,23 +274,6 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
         # A manual, targeted run: "generate for THIS channel/persona only,"
         # not whatever the shuffled full pool happens to land on.
         topics_query = topics_query.eq("persona_key", persona_key_filter)
-    else:
-        # No persona explicitly requested — this is the path every
-        # SCHEDULED (cron) run takes, with no --persona flag. Without a
-        # filter here this pulls from literally every is_active topic
-        # in the table, including old demo/leftover topics that predate
-        # this project's personas and were never assigned one (schema.sql's
-        # 5 seeded tech topics being the known example — persona_key IS
-        # NULL, is_active TRUE, never cleaned up by any migration). A
-        # persona-less topic has no channel that is actually supposed to
-        # use it, so it must never be eligible for an unscoped run.
-        active_personas = sorted({
-            c.get("persona_key") for c in
-            (db.table("channels").select("persona_key").eq("is_enabled", True).execute().data or [])
-            if c.get("persona_key")
-        })
-        if active_personas:
-            topics_query = topics_query.in_("persona_key", active_personas)
     if topic_id:
         # The most targeted case: one exact topic, chosen by hand in the
         # dashboard rather than left to the pool. persona_key_filter is
@@ -617,14 +600,21 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
             # Full precedence, most specific wins: a channel's own explicit
             # voice_override (the "these related voices for this channel"
             # control on the Channels page) beats the persona's own
-            # preferred_voice, which beats the single global Settings
-            # slider — that slider is now only the fallback for topics with
-            # no persona at all (manually added, or from before personas
-            # existed), not something that silently overrides every
-            # persona's own deliberate choice.
+            # preferred_voice, which beats a NEW tier — the voice that
+            # actually suits THIS video's tone (documentary_male for a
+            # "Documentary Narrator" video, energetic for "Mind-Blowing
+            # Facts", etc. — see voice_profile_for_tone's own mapping) —
+            # which in turn beats the single global Settings slider, now
+            # only the last-resort fallback for a tone this mapping does
+            # not recognize at all. A channel or persona that has
+            # deliberately pinned one voice keeps getting exactly that
+            # voice, unchanged; content-aware selection only fills the gap
+            # for channels that have not pinned anything, so variety is the
+            # new default rather than something that has to be opted into.
             voice_for_this_video = (
                 (resolved_channel.get("voice_override") if resolved_channel else None)
                 or (persona.get("preferred_voice") if persona else None)
+                or voice_profile_for_tone(tone.get("name") if tone else None)
                 or settings.get("voice_profile", "documentary_male")
             )
             result = _render_pipeline(

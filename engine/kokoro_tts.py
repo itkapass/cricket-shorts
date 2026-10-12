@@ -76,6 +76,7 @@ KOKORO_VOICE_PROFILES = {
     "british_calm":         ("bm_lewis", "en-gb"),
     "warm_female":           ("am_michael", "en-us"),  # redirected to male
     "young_casual":          ("am_puck", "en-us"),
+    "young_energetic_male":  ("am_puck", "en-us"),
     "default":               ("bm_george", "en-gb"),
 }
 

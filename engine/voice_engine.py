@@ -74,7 +74,22 @@ VOICE_PROFILES = {
     "energetic":          "en-US-ChristopherNeural",
     "british_calm":       "en-GB-RyanNeural",
     "warm_female":        "en-US-AriaNeural",
-    "young_casual":       "en-US-AnaNeural",
+    # BUGFIX: this was "en-US-AnaNeural" — a young FEMALE/child voice.
+    # kokoro_tts.py's own KOKORO_VOICE_PROFILES already redirects
+    # "young_casual" to a male voice (am_puck) specifically because of the
+    # standing "male voice everywhere" instruction, but this primary
+    # edge-tts map was never actually brought in line with that — so a
+    # video spoken by edge-tts (the common case) still got a female voice
+    # under this profile, and only a video that happened to fall back to
+    # Kokoro got corrected. Redirected the same way Kokoro's map already
+    # was, so BOTH engines agree now, not just the fallback one.
+    "young_casual":       "en-US-DavisNeural",
+    # NEW: an explicit option for livelier, younger-sounding narration,
+    # still male per the standing instruction. Worth A/B testing against
+    # "documentary_male" / "energetic" rather than assumed better — voice
+    # character is subjective, Microsoft's own persona labels are a
+    # starting point, not a guarantee of how it lands with your audience.
+    "young_energetic_male": "en-US-JasonNeural",
     "default":            "en-US-GuyNeural",
 }
 
@@ -87,6 +102,45 @@ CHARACTER_VOICES = {
     "stick": "en-US-ChristopherNeural",
     "suit":  "en-US-GuyNeural",
 }
+
+# Maps each of this app's 5 tones (see schema.sql's seeded `tones` rows) to
+# the voice profile that actually suits its delivery style — "Mind-Blowing
+# Facts" lands better punchy and confident than calm and measured, while
+# "Documentary Narrator" is explicitly asking for the opposite. This is
+# what makes voice choice content-aware rather than one fixed voice for
+# every video a channel makes, regardless of what that video actually is.
+# Case-insensitive, matched by substring so a renamed/custom tone with
+# similar wording still resolves sensibly instead of silently missing.
+TONE_VOICE_MAP = [
+    # (substring to look for in the tone name, voice profile)
+    ("mind-blowing", "energetic"),
+    ("mind blowing", "energetic"),
+    ("sarcastic",     "conversational"),
+    ("genuine advice", "young_casual"),
+    ("advice",        "young_casual"),
+    ("short story",   "young_energetic_male"),
+    ("story",         "young_energetic_male"),
+    ("documentary",   "documentary_male"),
+]
+
+
+def voice_profile_for_tone(tone_name: str) -> str | None:
+    """Best voice profile for a given tone name, or None if nothing matches
+    (caller falls through to its own default — this never invents a guess
+    for a tone it doesn't recognize).
+
+    Deliberately a pure function with no Supabase/network access: callers
+    already have the tone name in hand from the row they are processing, so
+    this only ever needs to do a plain string match, no I/O to fail on.
+    """
+    if not tone_name:
+        return None
+    needle = tone_name.strip().lower()
+    for substr, profile in TONE_VOICE_MAP:
+        if substr in needle:
+            return profile
+    return None
+
 
 TICKS_PER_SECOND = 10_000_000  # edge-tts reports offsets in 100ns ticks
 
