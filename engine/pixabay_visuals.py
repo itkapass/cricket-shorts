@@ -40,18 +40,27 @@ def available() -> bool:
 
 
 def fetch_for_scene(query: str, duration_needed: float, job_id: str,
-                    scene_number: int, output_dir: str) -> dict | None:
+                    scene_number: int, output_dir: str,
+                    exclude_ids: set = None) -> dict | None:
     """Tries a Pixabay VIDEO first (same look-and-feel as the Pexels path),
     then a Pixabay PHOTO turned into a Ken-Burns clip. Returns None if
     Pixabay has nothing usable either — the caller moves on to an
-    AI-generated image next."""
+    AI-generated image next.
+
+    `exclude_ids` — Pixabay hit ids already used by OTHER recent videos (see
+    engine/visual_usage.py). Pixabay search is deterministic by relevance, so
+    without this the same query always hands back the same top hit; we now
+    walk past any excluded id to the next hit instead of always taking the
+    first one, and only fall back to reusing the top hit if every candidate
+    is excluded.
+    """
     api_key = get("PIXABAY_API_KEY")
     if not api_key or not (query or "").strip():
         return None
 
     os.makedirs(output_dir, exist_ok=True)
 
-    video = _try_video(query, api_key)
+    video = _try_video(query, api_key, exclude_ids)
     if video:
         dest = os.path.join(output_dir, f"{job_id}_s{scene_number}_pixabay.mp4")
         try:
@@ -62,23 +71,25 @@ def fetch_for_scene(query: str, duration_needed: float, job_id: str,
                     f.write(chunk)
             print(f"[pixabay_visuals] ✓ Used Pixabay video for '{query}'")
             return {"clip_path": dest, "source": "pixabay_video",
-                    "keyword_used": query, "pexels_video_id": None}
+                    "keyword_used": query, "pexels_video_id": None,
+                    "visual_identifier": f"video:{video['id']}"}
         except Exception as e:
             print(f"[pixabay_visuals] ⚠ Video download failed: {e}")
 
-    photo_url = _try_photo(query, api_key)
-    if photo_url:
+    photo = _try_photo(query, api_key, exclude_ids)
+    if photo:
         img_path = os.path.join(output_dir, f"{job_id}_s{scene_number}_pixabay.jpg")
         mp4_path = os.path.join(output_dir, f"{job_id}_s{scene_number}_pixabay_img.mp4")
         try:
-            r = requests.get(photo_url, timeout=30)
+            r = requests.get(photo["url"], timeout=30)
             r.raise_for_status()
             with open(img_path, "wb") as f:
                 f.write(r.content)
             if image_to_clip(img_path, mp4_path, duration_needed, scene_number=scene_number, motion_seed=2):
                 print(f"[pixabay_visuals] ✓ Used Pixabay photo for '{query}'")
                 return {"clip_path": mp4_path, "source": "pixabay_photo",
-                        "keyword_used": query, "pexels_video_id": None}
+                        "keyword_used": query, "pexels_video_id": None,
+                        "visual_identifier": f"photo:{photo['id']}"}
         except Exception as e:
             print(f"[pixabay_visuals] ⚠ Photo fetch failed: {e}")
         finally:
@@ -91,24 +102,33 @@ def fetch_for_scene(query: str, duration_needed: float, job_id: str,
     return None
 
 
-def _try_video(query: str, api_key: str) -> dict | None:
+def _try_video(query: str, api_key: str, exclude_ids: set = None) -> dict | None:
     try:
         resp = requests.get(PIXABAY_VIDEO_API, params={
             "key": api_key, "q": query, "per_page": 6, "safesearch": "true",
         }, timeout=TIMEOUT_SECONDS)
         resp.raise_for_status()
         hits = resp.json().get("hits", [])
+        fallback = None
         for hit in hits:
             files = hit.get("videos", {})
             best = files.get("large") or files.get("medium") or files.get("small")
-            if best and best.get("url"):
-                return {"url": best["url"]}
+            if not (best and best.get("url")):
+                continue
+            result = {"url": best["url"], "id": hit.get("id")}
+            if fallback is None:
+                fallback = result
+            if not exclude_ids or str(hit.get("id")) not in exclude_ids:
+                return result
+        # Every candidate was already used elsewhere — reuse the top one
+        # rather than giving up and falling to a weaker provider.
+        return fallback
     except Exception as e:
         print(f"[pixabay_visuals] ⚠ Video search failed: {e}")
     return None
 
 
-def _try_photo(query: str, api_key: str) -> str | None:
+def _try_photo(query: str, api_key: str, exclude_ids: set = None) -> dict | None:
     try:
         resp = requests.get(PIXABAY_PHOTO_API, params={
             "key": api_key, "q": query, "per_page": 6, "safesearch": "true",
@@ -116,8 +136,17 @@ def _try_photo(query: str, api_key: str) -> str | None:
         }, timeout=TIMEOUT_SECONDS)
         resp.raise_for_status()
         hits = resp.json().get("hits", [])
-        if hits:
-            return hits[0].get("largeImageURL") or hits[0].get("webformatURL")
+        fallback = None
+        for hit in hits:
+            url = hit.get("largeImageURL") or hit.get("webformatURL")
+            if not url:
+                continue
+            result = {"url": url, "id": hit.get("id")}
+            if fallback is None:
+                fallback = result
+            if not exclude_ids or str(hit.get("id")) not in exclude_ids:
+                return result
+        return fallback
     except Exception as e:
         print(f"[pixabay_visuals] ⚠ Photo search failed: {e}")
     return None

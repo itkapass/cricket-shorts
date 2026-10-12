@@ -76,6 +76,8 @@ from engine import brief as brief_mod
 from engine import channels as channels_mod
 from engine import content_mix
 from engine import performance_loop
+from engine import visual_usage
+from engine import thumbnail_generator
 from engine.styles import is_multi_voice
 from engine.voice_engine import generate_multi_voice
 
@@ -161,6 +163,7 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
             return
 
     auto_approve = str(settings.get("auto_approve", "false")).lower() == "true"
+    want_thumbnails = str(settings.get("generate_thumbnails", "true")).lower() == "true"
 
     # Check storage BEFORE rendering anything. A render is 5+ minutes of
     # compute and discovering the bucket is full only at upload time throws
@@ -317,6 +320,15 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
             topics = [t for t in topics if t["id"] not in used_topic_ids]
             print(f"[orchestrator] Excluded {before - len(topics)} already-used topic(s) "
                   f"from selection — {len(topics)} genuinely fresh topic(s) remain.")
+
+    # "make sure the video generating error dont repeat again" is handled
+    # further down, in _log_failure: a topic that fails `topic_max_failures`
+    # times in a row gets `is_active` switched off right there (and shows up
+    # as "Paused" in Topic Studio, same as switching it off by hand), so it
+    # simply stops appearing in the `.eq("is_active", True)` query this
+    # function already runs above — no separate filter needed here, and a
+    # topic you manually re-activate in the dashboard is immediately
+    # eligible again with no extra step.
 
     # These two are the quietest failure in the whole system: with nothing
     # active, generation completes "successfully" having produced nothing, and
@@ -590,32 +602,34 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
                       f"{script_dup['matched_title']!r}")
                 continue
 
-            # BUGFIX: persona["preferred_voice"] was defined for all 8
-            # personas in personas.py but never actually read anywhere in
-            # this pipeline — every video, regardless of persona, used
-            # whichever single voice happened to be set in Settings. A
-            # tech explainer and a health/safety video sounded identical
-            # because nothing here ever looked at the persona's own choice.
+            # BUGFIX (second pass): the precedence below used to put
+            # persona.preferred_voice AHEAD of the tone-based lookup. That
+            # defeated its own stated purpose — this app ships exactly ONE
+            # persona (cricket_and_sports), every topic carries that same
+            # persona_key, and that persona always has a preferred_voice
+            # set. So the tone-based mapping right below it (documentary_
+            # male for "Documentary Narrator", energetic for "Mind-Blowing
+            # Facts", conversational for "Sarcastic Commentary", ...) was
+            # computed and then IMMEDIATELY discarded in favour of the same
+            # one fixed value on every single video, every single day. That
+            # is the actual mechanism behind "all videos have the same
+            # voice regardless of what I pick in Settings" — the Settings
+            # dropdown is the LAST fallback in this chain and a persona-
+            # tagged video (which is all of them here) never reaches it
+            # either.
             #
-            # Full precedence, most specific wins: a channel's own explicit
-            # voice_override (the "these related voices for this channel"
-            # control on the Channels page) beats the persona's own
-            # preferred_voice, which beats a NEW tier — the voice that
-            # actually suits THIS video's tone (documentary_male for a
-            # "Documentary Narrator" video, energetic for "Mind-Blowing
-            # Facts", etc. — see voice_profile_for_tone's own mapping) —
-            # which in turn beats the single global Settings slider, now
-            # only the last-resort fallback for a tone this mapping does
-            # not recognize at all. A channel or persona that has
-            # deliberately pinned one voice keeps getting exactly that
-            # voice, unchanged; content-aware selection only fills the gap
-            # for channels that have not pinned anything, so variety is the
-            # new default rather than something that has to be opted into.
+            # Full precedence now, most specific wins: a channel's own
+            # explicit voice_override beats content-aware tone-based
+            # selection (the actual source of per-video variety), which
+            # beats the persona's own preferred_voice (now a genuine
+            # fallback — see personas.py — used only for a tone this app's
+            # TONE_VOICE_MAP doesn't recognise), which beats the single
+            # global Settings dropdown as the final fallback.
             voice_for_this_video = (
                 (resolved_channel.get("voice_override") if resolved_channel else None)
-                or (persona.get("preferred_voice") if persona else None)
                 or voice_profile_for_tone(tone.get("name") if tone else None)
-                or settings.get("voice_profile", "documentary_male")
+                or (persona.get("preferred_voice") if persona else None)
+                or settings.get("voice_profile", "indian_male")
             )
             result = _render_pipeline(
                 job_id=job_id,
@@ -624,6 +638,8 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
                 branding=branding,
                 render_style=render_style,
                 persona_key=persona_key,
+                db=db,
+                want_thumbnail=want_thumbnails,
             )
 
             gates = result.get("quality", {})
@@ -632,7 +648,8 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
                 print(f"[orchestrator] \u2717 Video {i+1} failed quality gates: "
                       f"{quality_gates.summarize(gates)}")
                 _log_failure(db, job_id, topic, tone,
-                             f"Quality gates rejected: {quality_gates.summarize(gates)}")
+                             f"Quality gates rejected: {quality_gates.summarize(gates)}",
+                             count_against_topic=False)
                 continue
 
             # SAFETY OVERRIDE: a persona can mark itself requires_human_review
@@ -698,7 +715,8 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
             # video and fill the queue with red — which is exactly what
             # happened before this check existed.
             print(f"[orchestrator] \U0001f6d1 Stopping run: {e}")
-            _log_failure(db, job_id, topic, tone, f"Stopped early — Gemini quota: {e}")
+            _log_failure(db, job_id, topic, tone, f"Stopped early — Gemini quota: {e}",
+                         count_against_topic=False)
             alerts.alert(
                 "Generation stopped — Gemini daily quota reached",
                 f"{successful} video(s) were generated before the free-tier quota ran out.\n\n"
@@ -716,7 +734,8 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
                 # nothing to click on. Exactly the mystery this run created.
                 _log_failure(db, job_id, topic, tone,
                              f"Stopped early — Gemini's real daily quota was already used up "
-                             f"(likely from earlier attempts today, before quota tracking existed): {e}")
+                             f"(likely from earlier attempts today, before quota tracking existed): {e}",
+                             count_against_topic=False)
                 alerts.alert(
                     "Generation stopped — Gemini daily quota reached",
                     f"{successful} video(s) were generated before the free-tier quota ran out.\n\n"
@@ -729,7 +748,7 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
             print(f"[orchestrator] \u2717 Video {i+1} failed: {e}")
             errors.append(f"{topic.get('name','?')}: {str(e)[:160]}")
             traceback.print_exc()
-            _log_failure(db, job_id, topic, tone, str(e))
+            _log_failure(db, job_id, topic, tone, str(e), settings=settings)
 
     failed = attempted - successful - gate_rejected - concept_rejected
     print(f"\n{'='*60}")
@@ -759,7 +778,7 @@ def generate_video_from_prompt(
     tone_name: str = "Curious Explainer",
     tone_desc: str = "Clear, specific, genuinely informative — makes the viewer smarter in 45 seconds",
     hook_style: str = "Surprising Fact / Question",
-    voice_profile: str = "documentary_male",
+    voice_profile: str = "indian_male",
     render_style: str = DEFAULT_STYLE,
     storyboard_override: dict = None,
 ) -> dict:
@@ -782,13 +801,18 @@ def generate_video_from_prompt(
             hook_style=hook_style, num_scenes=5, render_style=render_style,
         )
 
+    try:
+        db = get_supabase()
+    except Exception:
+        db = None  # cross-video visual variety is best-effort, never required to render
+
     result = _render_pipeline(
         job_id=job_id, storyboard=storyboard, voice_profile=voice_profile,
-        branding=None, render_style=render_style,
+        branding=None, render_style=render_style, db=db,
     )
 
     try:
-        db = get_supabase()
+        db = db or get_supabase()
         _save_and_finalize(db, result, job_id, None, None, render_style, tone_name=tone_name)
         print(f"[orchestrator] \u2713 Custom video saved to Supabase video queue: Job {job_id}")
     except Exception as e:
@@ -806,11 +830,22 @@ def _render_pipeline(
     branding: dict,
     render_style: str,
     persona_key: str = None,
+    db: Client = None,
+    want_thumbnail: bool = True,
 ) -> dict:
     """Everything after 'we have a storyboard' — voiceover, timing, visuals,
     captions, audio mix, and final composition. Previously duplicated almost
     verbatim between the scheduled-batch path and the custom-prompt path;
-    now there's exactly one place this logic lives."""
+    now there's exactly one place this logic lives.
+
+    `db` — optional Supabase client, used ONLY to look up and record which
+    specific real photos/clips were used in other recent videos (see
+    engine/visual_usage.py), so the sports_visual chain can avoid repeating
+    the exact same asset video after video (the "same England clip every
+    time" bug). Passing None disables this cross-video memory for this one
+    render — visuals still render exactly as before, just without the extra
+    variety check — so every existing caller keeps working unchanged.
+    """
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
 
@@ -848,7 +883,17 @@ def _render_pipeline(
     # entirely for them. See engine.styles.uses_visual_fetch().
     if styles_mod.uses_visual_fetch(render_style):
         if render_style == "sports_visual":
-            scenes_with_clips = fetch_all_scene_clips_sports(scenes_with_times, job_id)
+            # Cross-video memory of which specific real photo/clip was already
+            # used elsewhere recently (see engine/visual_usage.py) — this is
+            # what fixes "the same England clip in every video": without it,
+            # Wikimedia/Pixabay/Pexels all independently gave back the same
+            # deterministic top result for a repeated search phrase, video
+            # after video. load_all() is best-effort and returns empty sets
+            # (i.e. "nothing to exclude") on any error, including db=None, so
+            # this never blocks a render over a database hiccup.
+            cross_video_exclusions = visual_usage.load_all(db)
+            scenes_with_clips = fetch_all_scene_clips_sports(
+                scenes_with_times, job_id, cross_video_exclusions=cross_video_exclusions)
         else:
             scenes_with_clips = fetch_all_scene_clips(scenes_with_times, job_id)
         # Fold each scene's actual visual source (pexels / wikimedia / pixabay
@@ -860,8 +905,36 @@ def _render_pipeline(
         # Groq) and the voice (edge-tts vs its fallbacks).
         for sb_scene, rendered_scene in zip(storyboard.get("scenes", []), scenes_with_clips):
             sb_scene["_visual_source"] = rendered_scene.get("source")
+            sb_scene["_visual_id"] = rendered_scene.get("visual_identifier")
+
+        if render_style == "sports_visual":
+            # Record every REAL asset this video actually used (never the
+            # designed stat/quiz cards or the flat-gradient fallback — see
+            # visual_usage.py's own docstring for why those don't count) so
+            # the NEXT video's load_all() above knows to steer away from it.
+            # Best-effort: record_many() swallows its own errors, so a
+            # database hiccup here costs future variety, never this render.
+            source_map = {
+                "pexels": "pexels", "cache": "pexels",
+                "wikimedia": "wikimedia",
+                "pixabay_video": "pixabay", "pixabay_photo": "pixabay",
+            }
+            usage_items = [
+                (source_map[rendered_scene["source"]], rendered_scene["visual_identifier"])
+                for rendered_scene in scenes_with_clips
+                if rendered_scene.get("source") in source_map and rendered_scene.get("visual_identifier")
+            ]
+            visual_usage.record_many(db, job_id, usage_items)
     else:
         scenes_with_clips = scenes_with_times
+
+    # Fold each scene's resolved timing back into the storyboard that gets
+    # saved — regardless of render style — so anything that runs AFTER this
+    # function (right now, just thumbnail_generator.py) can find "scene 1
+    # plays from 0.0s to 2.4s" without redoing timestamp math of its own.
+    for sb_scene, timed_scene in zip(storyboard.get("scenes", []), scenes_with_clips):
+        sb_scene["time_start"] = timed_scene.get("time_start")
+        sb_scene["time_end"] = timed_scene.get("time_end")
 
     caption_style = default_caption_style_for(render_style, persona_key)
     caption_style.words_per_card = 3
@@ -911,6 +984,19 @@ def _render_pipeline(
     gates = quality_gates.run_gates(video_path, storyboard)
     print(f"[orchestrator] Quality gates: {gates['verdict']} — {quality_gates.summarize(gates)}")
 
+    # A real frame from this exact video + a bold headline, not an AI image —
+    # see engine/thumbnail_generator.py's module docstring for why. Best-
+    # effort: a thumbnail failure here must never fail the video itself, it
+    # just publishes with YouTube's own auto-generated one instead.
+    thumbnail_path = None
+    if want_thumbnail:
+        try:
+            thumbnail_path = thumbnail_generator.generate_thumbnail(
+                video_path, storyboard, job_id, job_output_dir)
+        except Exception as e:
+            print(f"[orchestrator] ⚠ Thumbnail generation failed for {job_id} ({e}); "
+                  f"continuing without one.")
+
     return {
         "job_id": job_id, "video_path": video_path,
         "title": storyboard["video_title"], "description": storyboard["description"],
@@ -918,6 +1004,7 @@ def _render_pipeline(
         "storyboard": storyboard,
         "quality": gates,
         "captions_srt": captions_srt,
+        "thumbnail_path": thumbnail_path,
     }
 
 
@@ -951,12 +1038,28 @@ def _save_and_finalize(db, result, job_id, topic_id, tone_id, render_style, tone
         flags["quality_warnings"] = gates.get("warnings", [])
 
     # auto_approve is respected, but it never overrides a duplicate flag or a
-    # quality warning. Auto-approving a flagged video is precisely how a
-    # channel ends up publishing the thing that gets it reviewed.
+    # genuinely BLOCKING quality warning (see quality_gates.py's module
+    # docstring for the full story). Auto-approving a flagged video is
+    # precisely how a channel ends up publishing the thing that gets it
+    # reviewed — so this intentionally stays strict.
+    #
+    # BUGFIX: this used to be `gates.get("verdict") != "warn"`, which
+    # treated EVERY warning as equally disqualifying — including
+    # "caption_timing", which fires on almost every video this build makes
+    # (Kokoro, the PRIMARY voice engine, never reports exact word timing —
+    # see voice_engine.py). That made Auto-Approve effectively dead: the
+    # toggle was on, but nearly everything still landed in Pending Review
+    # anyway, for a reason that had nothing to do with that specific
+    # video's actual quality. quality_gates.has_blocking_warnings() only
+    # counts warnings that genuinely indicate something might be wrong with
+    # THIS video (bad audio, a frozen frame, a missing closing CTA, a
+    # cross-sport visual mismatch, wrong aspect ratio...) — the expected,
+    # by-design ones no longer veto a toggle you explicitly turned on.
     safe_to_auto = (
         auto_approve
         and not flags.get("possible_duplicate")
-        and gates.get("verdict") != "warn"
+        and gates.get("verdict") != "reject"
+        and not quality_gates.has_blocking_warnings(gates)
     )
     initial_status = "approved" if safe_to_auto else "pending"
 
@@ -994,6 +1097,18 @@ def _save_and_finalize(db, result, job_id, topic_id, tone_id, render_style, tone
     }).execute()
 
     storage_module.upload_video(result["video_path"], job_id, db=db)
+    if result.get("thumbnail_path"):
+        storage_module.upload_thumbnail(result["thumbnail_path"], job_id, db=db)
+
+    # A topic that previously failed a time or two but just produced a real
+    # video clearly isn't broken — reset its fail_count so a flaky-but-fine
+    # topic doesn't sit artificially close to the auto-retire threshold
+    # (see _log_failure and the fail_count filter in run_generation_pipeline).
+    if topic_id is not None:
+        try:
+            db.table("topics").update({"fail_count": 0}).eq("id", topic_id).execute()
+        except Exception:
+            pass  # cosmetic bookkeeping only — the video is already saved above
 
 
 # A single automatic run never renders more than this many videos.
@@ -1080,7 +1195,20 @@ def _expire_stale_render_jobs(db, max_age_hours: int = 3):
         print(f"[orchestrator] \u26a0 Could not clear stale render jobs: {e}")
 
 
-def _log_failure(db: Client, job_id: str, topic: dict, tone: dict, error: str):
+def _log_failure(db: Client, job_id: str, topic: dict, tone: dict, error: str,
+                 settings: dict = None, count_against_topic: bool = True):
+    """Logs a failed video row, and — only when `count_against_topic` is
+    True — counts it toward this topic's fail_count / possible auto-retire.
+
+    `count_against_topic=False` is for failures that are NOT evidence the
+    topic itself is a problem: a Gemini daily-quota stop, for instance, says
+    nothing about whichever topic happened to be mid-flight when the quota
+    ran out, and penalizing it would be exactly the kind of unfair, opaque
+    behaviour "make sure the error doesn't repeat" is asking to fix, not
+    reproduce under a new name. Only a genuine per-topic generation failure
+    (a refusal, JSON every provider failed to produce, etc.) should move a
+    topic toward auto-retirement.
+    """
     try:
         now = datetime.now(timezone.utc).isoformat()
         db.table("videos").insert({
@@ -1095,6 +1223,54 @@ def _log_failure(db: Client, job_id: str, topic: dict, tone: dict, error: str):
         }).execute()
     except Exception:
         pass  # Don't let logging failures crash the whole run
+
+    # Count this against the topic so a topic that fails over and over gets
+    # auto-retired instead of being retried forever at the cost of a full
+    # Gemini call every single run — "make sure the video generating error
+    # dont repeat again". Best-effort and entirely separate from the insert
+    # above — a failure here must never mask the fact that the video itself
+    # already failed and was already logged.
+    topic_id = topic.get("id")
+    if topic_id is None or not count_against_topic:
+        return
+    try:
+        max_failures = int((settings or {}).get("topic_max_failures") or 3)
+    except (TypeError, ValueError):
+        max_failures = 3
+    try:
+        current = (
+            db.table("topics").select("fail_count").eq("id", topic_id).execute().data
+        )
+        new_count = int((current[0].get("fail_count") or 0) if current else 0) + 1
+        update = {"fail_count": new_count}
+        retired_now = new_count >= max_failures
+        if retired_now:
+            # Flip the SAME is_active flag Topic Studio's own "Pause" button
+            # uses, rather than inventing a second, invisible kind of
+            # "off" — this is what makes an auto-retired topic actually show
+            # up as "Paused" in the dashboard (and a one-click "Activate"
+            # away from a fresh try) instead of silently vanishing with no
+            # visible trace of why it stopped being picked.
+            update["is_active"] = False
+        db.table("topics").update(update).eq("id", topic_id).execute()
+        if retired_now:
+            print(f"[orchestrator] \U0001f6d1 Topic {topic_id} ('{topic.get('name')}') failed "
+                  f"{new_count} times in a row (limit {max_failures}) — paused. Re-activate it "
+                  f"in Topic Studio to give it another try.")
+            alerts.alert(
+                f"Topic auto-paused after {new_count} failed attempts",
+                f"'{topic.get('name')}' kept failing to generate (most recent error: "
+                f"{error[:300]}) and has been switched off so it stops burning AI-call "
+                f"budget every run. Re-activate it in Topic Studio -> Topics if you want to "
+                f"give it another try.",
+                severity="warn",
+            )
+        elif new_count == 1:
+            print(f"[orchestrator] Topic {topic_id} ('{topic.get('name')}') just failed "
+                  f"for the first time this cycle (fail_count={new_count}).")
+    except Exception as e:
+        print(f"[orchestrator] ⚠ Could not update fail_count for topic {topic_id} ({e}) — "
+              f"migration 008 may not be applied yet; this topic just won't auto-retire.")
 
 
 def render_existing_job(job_id: str) -> dict:
@@ -1118,8 +1294,8 @@ def render_existing_job(job_id: str) -> dict:
 
     print(f"[orchestrator] \u2500\u2500 Rendering existing job {job_id} \u2500\u2500 style={render_style}")
     result = _render_pipeline(
-        job_id=job_id, storyboard=storyboard, voice_profile="documentary_male",
-        branding=None, render_style=render_style,
+        job_id=job_id, storyboard=storyboard, voice_profile="indian_male",
+        branding=None, render_style=render_style, db=db,
     )
 
     db.table("videos").update({
@@ -1127,6 +1303,8 @@ def render_existing_job(job_id: str) -> dict:
         "status": "pending",  # now actually rendered — ready for real human review
     }).eq("job_id", job_id).execute()
     storage_module.upload_video(result["video_path"], job_id, db=db)
+    if result.get("thumbnail_path"):
+        storage_module.upload_thumbnail(result["thumbnail_path"], job_id, db=db)
 
     print(f"[orchestrator] \u2713 Job {job_id} rendered and uploaded — check the Video Queue.")
     return result

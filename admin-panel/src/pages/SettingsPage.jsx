@@ -8,7 +8,7 @@ import NotificationSettings from '../components/NotificationSettings'
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState({
-    voice_profile: 'documentary_male',
+    voice_profile: 'indian_male',
     channel_name: '',
     publish_per_run: '1',
     max_videos_daily: '6',
@@ -17,7 +17,10 @@ export default function SettingsPage() {
     gemini_temperature: '0.9',
     auto_topic_personas: '',
     videos_per_run: '1',
-    publish_min_gap_minutes: '0'
+    publish_min_gap_minutes: '0',
+    publish_use_peak_hours: 'true',
+    publish_peak_hours_ist: '7-10,12-14,18-23',
+    generate_thumbnails: 'true'
   })
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -102,6 +105,7 @@ export default function SettingsPage() {
               value={settings.voice_profile}
               onChange={e => setSettings({ ...settings, voice_profile: e.target.value })}
             >
+              <option value="indian_male">Prabhat (en-IN) — Indian English, warm & conversational (recommended — this is your audience)</option>
               <option value="documentary_male">Guy (en-US) — Deep, cinematic, authoritative documentary narrator</option>
               <option value="conversational">Andrew (en-US) — Natural, friendly, casual explainer</option>
               <option value="energetic">Christopher (en-US) — Upbeat, fast-paced, high energy</option>
@@ -109,8 +113,18 @@ export default function SettingsPage() {
             </select>
             <div className="form-hint">
               100% free neural voices from Microsoft Edge Speech API with zero character limits.
-              Male voices only, by design — every built-in cricket/sports format already picks
-              one of these four automatically based on its archetype.
+              Male voices only, by design.
+              <br /><br />
+              <strong>This dropdown is a fallback, not a pin.</strong> Every built-in cricket/sports
+              video already picks a voice automatically based on its tone (Documentary Narrator,
+              Sarcastic Commentary, Mind-Blowing Facts, etc. each get a different voice — see
+              engine/voice_engine.py's TONE_VOICE_MAP) so videos sound varied, not identical. This
+              setting is only used when a video's tone doesn't match any of those rules.
+              <br /><br />
+              <strong>Prabhat (Indian English)</strong> is the default for a reason: roughly 85% of
+              this channel's content is cricket for a mostly-Indian audience, and a flat US/UK accent
+              reads as one step removed from the people actually watching — real feedback showed
+              viewers skipping in the first few seconds partly because of this.
             </div>
           </div>
         </div>
@@ -330,6 +344,76 @@ export default function SettingsPage() {
             </div>
           </div>
 
+          {/* Peak Posting Hours — best times for an Indian cricket audience */}
+          <div style={{
+            background: 'var(--bg-elevated)',
+            padding: 16,
+            borderRadius: 'var(--radius-sm)',
+            border: '1px solid var(--border)',
+            marginTop: 8
+          }}>
+            <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer' }}>
+              <div>
+                <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>Only Post During Peak Hours (recommended)</div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: 2 }}>
+                  Skips a publish slot if it would land outside the hours below, instead of
+                  posting whenever the spacing math happens to land — including 3am IST.
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.publish_use_peak_hours === 'true'}
+                onChange={e => setSettings({ ...settings, publish_use_peak_hours: e.target.checked ? 'true' : 'false' })}
+              />
+            </label>
+
+            {settings.publish_use_peak_hours === 'true' && (
+              <div className="form-group" style={{ marginTop: 12, marginBottom: 0 }}>
+                <label className="form-label">Peak Hours (IST, 24h, comma-separated ranges)</label>
+                <input
+                  type="text"
+                  className="form-input"
+                  value={settings.publish_peak_hours_ist}
+                  onChange={e => setSettings({ ...settings, publish_peak_hours_ist: e.target.value })}
+                  placeholder="7-10,12-14,18-23"
+                />
+                <div className="form-hint">
+                  This audience is mostly Indian cricket fans, so posting times are set in{' '}
+                  <strong>IST</strong>, not server time. The default (<code>7-10,12-14,18-23</code>)
+                  covers the morning commute/tea window, lunch, and the evening-through-late-night
+                  stretch when cricket chatter peaks (matches most often run into the evening IST).
+                  Each range is <code>startHour-endHour</code>, both inclusive, 0-23.
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Automatic Thumbnails */}
+          <div style={{
+            background: 'var(--bg-elevated)',
+            padding: 16,
+            borderRadius: 'var(--radius-sm)',
+            border: '1px solid var(--border)',
+            marginTop: 8
+          }}>
+            <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer' }}>
+              <div>
+                <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>Generate Thumbnails Automatically</div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: 2 }}>
+                  A real frame from the video itself (never an AI-generated image) with a bold
+                  headline overlaid — uploaded automatically alongside the video. Requires the
+                  channel's Google account to be phone-verified at youtube.com/verify, or YouTube
+                  will just keep its own auto-generated thumbnail instead.
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.generate_thumbnails === 'true'}
+                onChange={e => setSettings({ ...settings, generate_thumbnails: e.target.checked ? 'true' : 'false' })}
+              />
+            </label>
+          </div>
+
           {/* Auto Approve Warning */}
           <div style={{ 
             background: 'var(--bg-elevated)', 
@@ -366,7 +450,15 @@ export default function SettingsPage() {
               }}>
                 <AlertTriangle size={16} flexShrink={0} />
                 <span>
-                  <strong>YPP Warning:</strong> Disabling human review increases the risk of YouTube flagging the channel as "Reused / Low-Effort Content".
+                  <strong>YPP Warning:</strong> Auto-Approve still routes a video to Pending Review
+                  instead of auto-approving it whenever something about THAT specific video looks
+                  risky — a possible duplicate, bad audio, a missing closing CTA, a cross-sport
+                  visual mismatch, wrong aspect ratio, etc. (see engine/quality_gates.py). It does
+                  not catch everything a human eye would — repetitive structure, a weak hook,
+                  mispronunciations — so turning it on still raises your real exposure to
+                  YouTube flagging the channel as "Reused / Low-Effort Content" versus watching
+                  every video yourself. Safer middle ground: leave it off and use "Approve All"
+                  on the Video Queue page after a quick skim of the thumbnails/titles.
                 </span>
               </div>
             )}

@@ -104,12 +104,22 @@ def _image_info(titles: list) -> list:
 
 
 def fetch_photo_for_scene(query: str, duration_needed: float, job_id: str,
-                          scene_number: int, output_dir: str) -> dict | None:
+                          scene_number: int, output_dir: str,
+                          exclude_titles: set = None) -> dict | None:
     """Searches Commons, downloads the best real photo for `query`, and
     converts it into a short .mp4. Returns the same shape visual_fetcher's
     other providers use, or None if nothing usable was found — callers move
     on to the next provider in the chain on None, exactly like every other
     best-effort visual source in this project.
+
+    `exclude_titles` — file titles (e.g. 'File:Sachin Tendulkar 2011.jpg')
+    already used by OTHER recent videos (see engine/visual_usage.py). Commons
+    search is fully deterministic — the same query always returns the same
+    top hit first — so without this, two unrelated videos that happen to
+    search similar text get the exact same photo every time. We skip any
+    excluded title and fall through to the next real candidate instead; only
+    if literally every candidate is excluded do we return None, same as a
+    genuinely empty search.
     """
     query = (query or "").strip()
     if not query:
@@ -128,6 +138,15 @@ def fetch_photo_for_scene(query: str, duration_needed: float, job_id: str,
     if not candidates:
         print(f"[wikimedia_visuals] No usable Commons image found for '{query}'.")
         return None
+
+    if exclude_titles:
+        fresh = [c for c in candidates if c["title"] not in exclude_titles]
+        if fresh:
+            candidates = fresh
+        else:
+            print(f"[wikimedia_visuals] All {len(candidates)} candidate(s) for "
+                  f"'{query}' were already used in a recent video — reusing the "
+                  f"top one anyway rather than returning nothing.")
 
     best = candidates[0]
     os.makedirs(output_dir, exist_ok=True)
@@ -156,4 +175,5 @@ def fetch_photo_for_scene(query: str, duration_needed: float, job_id: str,
     return {
         "clip_path": mp4_path, "source": "wikimedia",
         "keyword_used": query, "pexels_video_id": None,
+        "visual_identifier": best["title"],
     }

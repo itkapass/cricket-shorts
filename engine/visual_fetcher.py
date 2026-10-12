@@ -12,6 +12,7 @@ The output contract (list of local video file paths) stays the same.
 """
 
 import os
+import json
 import random
 import hashlib
 import requests
@@ -45,6 +46,7 @@ def fetch_clip_for_scene(
     scene_number: int = 1,
     exclude_video_ids: set = None,
     scene_text: str = "",
+    cross_video_exclude_ids: set = None,
 ) -> dict:
     """
     Fetches the best matching video clip for a scene's visual keyword.
@@ -62,6 +64,16 @@ def fetch_clip_for_scene(
             The same unrelated stock clip of a person in goggles showed up twice in one
             real generated video for exactly this reason. This checks the actual video ID
             Pexels assigns, not the search text used to find it.
+        cross_video_exclude_ids: Pexels video IDs already used in OTHER recent videos
+            (see engine/visual_usage.py). This fixes the other half of the "repeated
+            England clip" bug that lived in THIS file: the on-disk cache below is keyed
+            only by the exact keyword text, so two different videos whose scripts
+            happened to produce the same (or a near-identical) search phrase got served
+            the exact same cached .mp4, forever, with no way to tell. A small sidecar
+            .json next to each cached clip now remembers which Pexels video ID it
+            actually is, so a cache hit on this exclusion list is treated as a miss and a
+            fresh search runs instead, exactly as if nothing had been cached for this
+            keyword.
 
     Returns:
         {
@@ -70,25 +82,42 @@ def fetch_clip_for_scene(
             "duration": 15.3,
             "keyword_used": "silicon wafer semiconductor cleanroom",
             "pexels_video_id": 1234567 | None,
+            "visual_identifier": "1234567" | None,   # for cross-video dedup bookkeeping
         }
     """
     cfg = require(["PEXELS_API_KEY"])
     os.makedirs(CLIP_CACHE_DIR, exist_ok=True)
     exclude_video_ids = exclude_video_ids or set()
+    cross_video_exclude_ids = cross_video_exclude_ids or set()
+    all_exclude_ids = exclude_video_ids | cross_video_exclude_ids
 
-    # Check cache first (hash the keyword to get a stable filename). Cache
-    # hits skip the exclude check by design — if you asked for this EXACT
-    # keyword text twice, you're deliberately reusing it (e.g. no-results
-    # fallback), not accidentally repeating unrelated footage.
+    # Check cache first (hash the keyword to get a stable filename).
     cache_key = hashlib.md5(visual_keyword.encode()).hexdigest()[:12]
     cached_path = os.path.join(CLIP_CACHE_DIR, f"{cache_key}.mp4")
+    meta_path = os.path.join(CLIP_CACHE_DIR, f"{cache_key}.json")
 
     if os.path.exists(cached_path):
-        print(f"[visual_fetcher] Scene {scene_number}: Using cached clip for '{visual_keyword}'")
-        return {
-            "clip_path": cached_path, "source": "cache",
-            "keyword_used": visual_keyword, "pexels_video_id": None,
-        }
+        cached_video_id = None
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path) as f:
+                    cached_video_id = (json.load(f) or {}).get("pexels_video_id")
+            except Exception:
+                cached_video_id = None
+
+        if cached_video_id is None or str(cached_video_id) not in cross_video_exclude_ids:
+            # Either a cache entry from before this fix (no id recorded — assume
+            # fine, same as the old behaviour), or a real id that is not on the
+            # cross-video exclusion list. Deliberate exact-keyword reuse is fine.
+            print(f"[visual_fetcher] Scene {scene_number}: Using cached clip for '{visual_keyword}'")
+            return {
+                "clip_path": cached_path, "source": "cache",
+                "keyword_used": visual_keyword, "pexels_video_id": cached_video_id,
+                "visual_identifier": str(cached_video_id) if cached_video_id is not None else None,
+            }
+        print(f"[visual_fetcher] Scene {scene_number}: Cached clip for '{visual_keyword}' "
+              f"(pexels id={cached_video_id}) was already used in another recent video — "
+              f"searching for a fresh one instead.")
 
     # ── Search Pexels API ─────────────────────────────────────────────────────
     print(f"[visual_fetcher] Scene {scene_number}: Searching Pexels for '{visual_keyword}'...")
@@ -110,7 +139,7 @@ def fetch_clip_for_scene(
         return _get_fallback(job_id, scene_number, visual_keyword, scene_text, duration_needed)
 
     videos = data.get("videos", [])
-    clip = _select_best_clip(videos, duration_needed, exclude_video_ids, scene_text, visual_keyword)
+    clip = _select_best_clip(videos, duration_needed, all_exclude_ids, scene_text, visual_keyword)
 
     if not clip:
         print(f"[visual_fetcher] \u26a0 No usable results for '{visual_keyword}'. Trying broader query...")
@@ -120,7 +149,7 @@ def fetch_clip_for_scene(
             resp = requests.get(PEXELS_VIDEO_API, headers=headers, params=params, timeout=15)
             data = resp.json()
             videos = data.get("videos", [])
-            clip = _select_best_clip(videos, duration_needed, exclude_video_ids, scene_text, visual_keyword)
+            clip = _select_best_clip(videos, duration_needed, all_exclude_ids, scene_text, visual_keyword)
         except Exception:
             pass
 
@@ -140,6 +169,11 @@ def fetch_clip_for_scene(
             for chunk in vid_resp.iter_content(chunk_size=1024 * 1024):
                 f.write(chunk)
         print(f"[visual_fetcher] \u2713 Saved to cache: {cached_path}")
+        try:
+            with open(meta_path, "w") as f:
+                json.dump({"pexels_video_id": clip["video_id"], "keyword": visual_keyword}, f)
+        except Exception:
+            pass  # bookkeeping only — never block a successful download over this
     except Exception as e:
         print(f"[visual_fetcher] \u26a0 Download failed: {e}. Using fallback.")
         return _get_fallback(job_id, scene_number, visual_keyword, scene_text, duration_needed)
@@ -147,6 +181,7 @@ def fetch_clip_for_scene(
     return {
         "clip_path": cached_path, "source": "pexels",
         "keyword_used": visual_keyword, "pexels_video_id": clip["video_id"],
+        "visual_identifier": str(clip["video_id"]),
     }
 
 
@@ -226,9 +261,16 @@ def pexels_available() -> bool:
 
 
 def fetch_all_scene_clips_sports(scenes_with_times: list, job_id: str,
-                                 output_dir: str = None) -> list:
+                                 output_dir: str = None,
+                                 cross_video_exclusions: dict = None) -> list:
+    """`cross_video_exclusions` — the dict returned by engine.visual_usage.load_all(db):
+    {"pexels": {...ids}, "wikimedia": {...titles}, "pixabay": {...ids}}. Pass None (the
+    default) to render exactly as before this feature existed — every provider treats
+    a missing/empty set as "nothing to exclude", so this is purely additive.
+    """
     output_dir = output_dir or CLIP_CACHE_DIR
     os.makedirs(output_dir, exist_ok=True)
+    cross_video_exclusions = cross_video_exclusions or {}
 
     enriched_scenes = []
     used_keywords = set()
@@ -255,6 +297,7 @@ def fetch_all_scene_clips_sports(scenes_with_times: list, job_id: str,
             wiki_subject=wiki_subject, keyword=keyword, scene_text=scene.get("voice_text", ""),
             duration_needed=duration_needed, job_id=job_id, scene_number=scene_number,
             exclude_video_ids=used_video_ids, output_dir=output_dir,
+            cross_video_exclusions=cross_video_exclusions,
         )
         if clip_info.get("pexels_video_id"):
             used_video_ids.add(clip_info["pexels_video_id"])
@@ -266,13 +309,20 @@ def fetch_all_scene_clips_sports(scenes_with_times: list, job_id: str,
 
 def _fetch_sports_visual_chain(wiki_subject: str, keyword: str, scene_text: str,
                                duration_needed: float, job_id: str, scene_number: int,
-                               exclude_video_ids: set, output_dir: str) -> dict:
+                               exclude_video_ids: set, output_dir: str,
+                               cross_video_exclusions: dict = None) -> dict:
+    cross_video_exclusions = cross_video_exclusions or {}
+    cross_wiki = cross_video_exclusions.get("wikimedia") or set()
+    cross_pexels = cross_video_exclusions.get("pexels") or set()
+    cross_pixabay = cross_video_exclusions.get("pixabay") or set()
+
     # 1. Wikimedia with the specific named subject, if the storyboard gave one.
     if wiki_subject:
         try:
             from engine import wikimedia_visuals
             result = wikimedia_visuals.fetch_photo_for_scene(
-                wiki_subject, duration_needed, job_id, scene_number, output_dir)
+                wiki_subject, duration_needed, job_id, scene_number, output_dir,
+                exclude_titles=cross_wiki)
             if result:
                 return result
         except Exception as e:
@@ -284,6 +334,7 @@ def _fetch_sports_visual_chain(wiki_subject: str, keyword: str, scene_text: str,
             result = fetch_clip_for_scene(
                 visual_keyword=keyword, duration_needed=duration_needed, job_id=job_id,
                 scene_number=scene_number, exclude_video_ids=exclude_video_ids, scene_text=scene_text,
+                cross_video_exclude_ids=cross_pexels,
             )
             # fetch_clip_for_scene already falls through to Hugging Face/gradient
             # internally on a bad search, so a real clip_path here means real
@@ -298,7 +349,8 @@ def _fetch_sports_visual_chain(wiki_subject: str, keyword: str, scene_text: str,
     try:
         from engine import pixabay_visuals
         if pixabay_visuals.available() and keyword:
-            result = pixabay_visuals.fetch_for_scene(keyword, duration_needed, job_id, scene_number, output_dir)
+            result = pixabay_visuals.fetch_for_scene(keyword, duration_needed, job_id, scene_number,
+                                                      output_dir, exclude_ids=cross_pixabay)
             if result:
                 return result
     except Exception as e:
@@ -309,7 +361,9 @@ def _fetch_sports_visual_chain(wiki_subject: str, keyword: str, scene_text: str,
     if keyword:
         try:
             from engine import wikimedia_visuals
-            result = wikimedia_visuals.fetch_photo_for_scene(keyword, duration_needed, job_id, scene_number, output_dir)
+            result = wikimedia_visuals.fetch_photo_for_scene(
+                keyword, duration_needed, job_id, scene_number, output_dir,
+                exclude_titles=cross_wiki)
             if result:
                 return result
         except Exception as e:
@@ -383,12 +437,18 @@ def rank_candidates_with_ai(scene_text: str, keyword: str, candidates: list) -> 
 def _select_best_clip(videos: list, duration_needed: float, exclude_video_ids: set = None,
                       scene_text: str = "", keyword_used: str = "") -> dict | None:
     """Selects the best video file from Pexels results, skipping any whose
-    parent video ID is already in exclude_video_ids."""
-    exclude_video_ids = exclude_video_ids or set()
+    parent video ID is already in exclude_video_ids.
+
+    Compares as strings so callers can freely mix this-video ids (ints, as
+    the Pexels API returns them) with cross-video ids loaded back out of the
+    visual_usage table (stored, and therefore returned, as strings) in one
+    set without either kind silently failing to match the other.
+    """
+    exclude_ids_str = {str(x) for x in (exclude_video_ids or set())}
     candidates = []
 
     for video in videos:
-        if video.get("id") in exclude_video_ids:
+        if str(video.get("id")) in exclude_ids_str:
             continue
         # The uploader's own words about the clip. This is the only signal
         # available for judging relevance without downloading and analysing
@@ -407,7 +467,7 @@ def _select_best_clip(videos: list, duration_needed: float, exclude_video_ids: s
     if not candidates:
         # Loosen requirements — accept any reasonable resolution (still excluding repeats)
         for video in videos:
-            if video.get("id") in exclude_video_ids:
+            if str(video.get("id")) in exclude_ids_str:
                 continue
             for file in video.get("video_files", []):
                 if file.get("width", 0) >= 1280:

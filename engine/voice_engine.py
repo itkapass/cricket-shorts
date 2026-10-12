@@ -90,8 +90,29 @@ VOICE_PROFILES = {
     # character is subjective, Microsoft's own persona labels are a
     # starting point, not a guarantee of how it lands with your audience.
     "young_energetic_male": "en-US-JasonNeural",
+    # NEW: a real Indian-English Microsoft neural voice. Added because this
+    # channel's audience is ~85% cricket-focused and overwhelmingly Indian —
+    # a flat American/British accent reads as a step removed from the
+    # audience, and is one of the reasons short-form viewers bail in the
+    # first few seconds. See INDIAN_ACCENT_PROFILES below and
+    # kokoro_tts.py's KOKORO_VOICE_PROFILES for how this is kept reachable
+    # even on a day edge-tts's network call fails.
+    "indian_male":         "en-IN-PrabhatNeural",
+    "indian_conversational": "en-IN-PrabhatNeural",
     "default":            "en-US-GuyNeural",
 }
+
+# Profiles that specifically need an Indian-accented voice to deliver what
+# was actually asked for. edge-tts is the ONLY engine in this project's
+# chain that has a real Indian-English voice at all (Kokoro's model pack is
+# American/British only — see kokoro_tts.py's KOKORO_VOICE_PROFILES) so for
+# these profiles ONLY, edge-tts is tried FIRST instead of Kokoro, accepting
+# the small extra reliability risk (edge-tts can be rate-limited on
+# datacenter IPs — see this module's own docstring) in exchange for actually
+# getting the requested accent on a normal day. Every OTHER profile keeps
+# Kokoro first, unchanged, for the reliability reasons already documented
+# above.
+INDIAN_ACCENT_PROFILES = {"indian_male", "indian_conversational"}
 
 # Per-character voices for the character_skit style. Two characters talking in
 # the same voice is instantly confusing, so each cast member gets its own.
@@ -116,11 +137,18 @@ TONE_VOICE_MAP = [
     ("mind-blowing", "energetic"),
     ("mind blowing", "energetic"),
     ("sarcastic",     "conversational"),
-    ("genuine advice", "young_casual"),
-    ("advice",        "young_casual"),
+    ("genuine advice", "indian_conversational"),
+    ("advice",        "indian_conversational"),
     ("short story",   "young_energetic_male"),
     ("story",         "young_energetic_male"),
-    ("documentary",   "documentary_male"),
+    # "Documentary Narrator" tone used to map to the deep, formal
+    # "documentary_male" voice (Guy) — exactly the "robotic, a bit elite"
+    # voice feedback kept coming back about. documentary content on this
+    # channel still benefits from sounding grounded and credible, but that
+    # does not require sounding like a nature-channel narrator — a warm
+    # Indian-accented voice reads as more like someone explaining real
+    # cricket history to you, which is the actual goal here.
+    ("documentary",   "indian_male"),
 ]
 
 
@@ -400,9 +428,27 @@ def generate_voiceover(
     voice_id = voice_id or VOICE_PROFILES.get(voice_profile, VOICE_PROFILES["default"])
     print(f"[voice_engine] Generating TTS: profile='{voice_profile}', job='{job_id}'")
 
-    words, engine = _try_kokoro(full_script, voice_profile, audio_path), "kokoro"
-    if words is None:
+    # Engine order is profile-aware (see INDIAN_ACCENT_PROFILES above): only
+    # edge-tts can actually deliver an Indian-English accent, so profiles
+    # that asked for one try it FIRST. Every other profile keeps the
+    # original Kokoro-first order unchanged, for the reliability reasons in
+    # this module's docstring.
+    wants_indian_accent = voice_profile in INDIAN_ACCENT_PROFILES
+    words = engine = None
+    if wants_indian_accent:
         words, engine = _try_edge_tts(full_script, voice_id, audio_path), "edge-tts"
+        if words is None:
+            words, engine = _try_kokoro(full_script, voice_profile, audio_path), "kokoro"
+            if words is not None:
+                print(f"[voice_engine] ℹ '{voice_profile}' asked for an Indian-English "
+                      f"accent, but edge-tts was unreachable this run — this video's "
+                      f"narration used Kokoro's closest offline voice instead (not "
+                      f"Indian-accented). This is occasional, not systemic; most runs "
+                      f"reach edge-tts fine.")
+    else:
+        words, engine = _try_kokoro(full_script, voice_profile, audio_path), "kokoro"
+        if words is None:
+            words, engine = _try_edge_tts(full_script, voice_id, audio_path), "edge-tts"
     if words is None:
         words, engine = _try_piper(full_script, audio_path), "piper"
     if words is None:
