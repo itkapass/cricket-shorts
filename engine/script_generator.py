@@ -489,6 +489,16 @@ RULES:
    fact or question related to the topic. Never "Hello guys" or "In this
    video". The hook has to be TRUE and be something the rest of the video
    actually delivers on — don't promise a twist you don't pay off.
+   PATTERN-INTERRUPT TECHNIQUE: the first 3-5 WORDS carry the weight, not
+   the first sentence — someone decides whether to keep watching before
+   the sentence finishes. Lead with the single most surprising word, number,
+   or name in the whole video, not a scene-setting clause that gets there
+   eventually. "Ben Stokes taps the pitch 9 times" beats "Did you know elite
+   batsmen have a pre-delivery ritual" — same fact, but the first already
+   has the specific, concrete image in word one; the second spends its first
+   5 words on throat-clearing. Avoid these openers entirely: "Did you
+   know...", "Here's something crazy...", "You won't believe...", "Let me
+   tell you about..." — all four delay the actual hook by a full clause.
 3. PACING: every scene is punchy (1-2 sentences max). Cut every unnecessary word.
 4. ENDING (scene {num_scenes}): this is NOT optional — the final scene's
    voice_text MUST end with one short, natural sentence that does ONE of

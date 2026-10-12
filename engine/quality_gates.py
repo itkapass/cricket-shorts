@@ -218,6 +218,57 @@ def run_gates(video_path: str, storyboard: dict = None, expect_audio: bool = Tru
                 f"timing and may drift from the audio, especially on longer lines. "
                 f"Watch this one before approving.")
 
+        # ── Closing CTA present ─────────────────────────────────────────────
+        # script_generator.py's prompt now REQUIRES the final scene to end on
+        # a question/follow/share/subscribe line (see RULES item 4), but a
+        # prompt instruction is a request, not a guarantee — Gemini (or a
+        # backup provider) can still skip it, same as it skipped it before
+        # this rule existed. This is the mechanical back-check: if auto
+        # approve is ever going to be trusted, it has to depend on checks
+        # like this, not on faith that the model followed instructions.
+        scenes = storyboard.get("scenes") or []
+        if scenes:
+            last_voice_text = (scenes[-1].get("voice_text") or "").strip().lower()
+            cta_markers = ("?", "follow", "subscribe", "comment", "share", "send this",
+                           "part 2", "next time", "miss it", "don't miss")
+            has_cta = any(m in last_voice_text for m in cta_markers)
+            add("closing_cta", has_cta, "warn",
+                "the final scene doesn't end with a question, follow/subscribe/share "
+                "line, or part-2 tease — this video may just stop on the fact with no "
+                "reason given to keep engaging. Worth a look before approving.")
+
+        # ── Visual keywords are sport-locked ────────────────────────────────
+        # THE CONFIRMED BUG THIS CATCHES: a cricket video that cut to baseball
+        # stock footage because its visual_keyword was a bare action phrase
+        # ("claims a relay") with no sport name in it, so stock search
+        # matched the wrong sport. The prompt now requires the sport's name
+        # (or a named player/ground/sport-unique term) in every
+        # visual_keyword — this is the mechanical back-check for that rule,
+        # same reasoning as closing_cta above: a heuristic, not a guarantee
+        # (it cannot watch the actual footage), so it warns a human to look
+        # rather than silently rejecting a video that may well be fine.
+        SPORT_UNIQUE_TERMS = (
+            "cricket", "wicket", "stump", "lbw", "googly", "crease", "over", "bowler",
+            "batsman", "batter", "innings", "yorker", "spinner", "boundary", "powerplay",
+            "lanka", "football", "soccer", "basketball", "nba", "tennis", "golf", "rugby",
+            "hockey", "baseball", "volleyball", "badminton", "f1", "formula",
+        )
+        suspect_keywords = []
+        for sc in scenes:
+            kw = (sc.get("visual_keyword") or "").strip()
+            if not kw:
+                continue
+            kw_lower = kw.lower()
+            has_sport_term = any(term in kw_lower for term in SPORT_UNIQUE_TERMS)
+            has_proper_noun = any(w[:1].isupper() for w in kw.split()[1:])  # skip first word (sentence-case)
+            if not has_sport_term and not has_proper_noun:
+                suspect_keywords.append(kw)
+        if suspect_keywords:
+            add("visual_sport_lock", False, "warn",
+                f"{len(suspect_keywords)} scene(s) have a visual_keyword with no sport "
+                f"name or named subject — stock search may return the wrong sport "
+                f"entirely: {suspect_keywords[:3]}")
+
     if result["failures"]:
         result["verdict"] = "reject"
     elif result["warnings"]:

@@ -84,6 +84,18 @@ WHAT MAKES A TOPIC WORTH MAKING, IN ORDER OF IMPORTANCE:
    misconception, cost, comparison, edge case) across the batch, not just the
    subject matter.
 
+6. WHEN THE DOMAIN ALLOWS REAL NAMED PLAYERS/EVENTS (see the exception in
+   the list below): prefer anchoring the topic to ONE specific real player,
+   match, or moment over a generic "here is how rule X works" framing — even
+   when covering the same rule. This is not a style preference, it is a
+   measured result: on this exact channel, topics built around a specific
+   named player or real incident ("Ben Stokes' pitch-tap habit", "the puddle
+   that flipped a toss") have drawn 15-45x the views of same-length videos
+   that explained a rule in the abstract with no named anchor, even though
+   both were produced by the identical pipeline. A rule can still be the
+   SUBJECT, but reach it through a real player or moment whenever one
+   plausibly exists, rather than starting from the rule itself.
+
 Every idea must:
   - Fit the domain description — do not drift into an unrelated domain.
   - Be genuinely different from every existing topic and seed example given.
