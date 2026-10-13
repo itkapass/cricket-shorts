@@ -34,7 +34,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.config import require, get
-from engine.publisher import upload_video
+from engine.publisher import upload_video, set_thumbnail
 from engine import channels as channels_mod
 from engine import concept_memory
 from engine import storage_r2
@@ -111,6 +111,7 @@ def run_publish_pipeline():
         print(f"\n[publish] Publishing: '{row['title']}' (job_id: {job_id})"
               + ("  [FORCED - Publish Now]" if is_forced else ""))
         tmp_path = None
+        tmp_thumb_path = None
 
         try:
             # ── Pick the destination channel ─────────────────────────────
@@ -194,7 +195,11 @@ def run_publish_pipeline():
                 title=row["title"],
                 description=row.get("description", ""),
                 hashtags=hashtags,
-                category="tech",
+                # FIXED: this was hardcoded "tech" for every single upload —
+                # on a cricket/sports channel that mis-categorized every
+                # video published so far on YouTube's own side (see
+                # publisher.py's CATEGORY_MAP for the full story).
+                category="sports",
                 privacy="public",
                 notify_subscribers=False,
                 creds_override=creds,
@@ -212,6 +217,25 @@ def run_publish_pipeline():
                 # keeps this current on UPDATE, only an insert-time default.
                 "updated_at":   datetime.now(timezone.utc).isoformat(),
             }).eq("id", row["id"]).execute()
+
+            # Custom thumbnail, if orchestrator.py's thumbnail_generator.py
+            # built one for this video. Best-effort and strictly AFTER the
+            # video itself is confirmed live — see set_thumbnail()'s own
+            # docstring for the one real prerequisite (a phone-verified
+            # YouTube account) and what happens when that isn't done yet.
+            thumbnail_url = row.get("thumbnail_url")
+            if thumbnail_url:
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+                        tmp_thumb_path = tf.name
+                        thumb_resp = requests.get(thumbnail_url, stream=True, timeout=30)
+                        thumb_resp.raise_for_status()
+                        for chunk in thumb_resp.iter_content(chunk_size=1024 * 1024):
+                            tf.write(chunk)
+                    set_thumbnail(result["video_id"], tmp_thumb_path, creds_override=creds)
+                except Exception as e:
+                    print(f"[publish] ⚠ Could not set custom thumbnail for {job_id} ({e}). "
+                          f"The video itself published fine with YouTube's default thumbnail.")
 
             # Commit the concept to the permanent ledger only now, on the way
             # out. Recording it at generation time would burn the idea even
@@ -250,6 +274,8 @@ def run_publish_pipeline():
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            if tmp_thumb_path and os.path.exists(tmp_thumb_path):
+                os.unlink(tmp_thumb_path)
 
 
 def _explain_error(e: Exception) -> str:

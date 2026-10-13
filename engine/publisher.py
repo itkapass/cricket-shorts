@@ -76,10 +76,22 @@ CLIENT_SECRETS_FILE = "engine/youtube_client_secrets.json"
 # 28 = Science & Technology (best for tech explainers → highest RPM)
 # 27 = Education
 # 22 = People & Blogs (sarcasm / advice content)
+# 17 = Sports
+#
+# FIXED: this map had no "sports" entry at all, so every video this app has
+# ever published — a cricket/sports channel, 100% of the time — fell through
+# to CATEGORY_MAP["default"], which was "28" (Science & Technology). Every
+# video was mis-categorized on YouTube's own side from day one: wrong
+# related-videos pool, wrong audience, and a worse match for YouTube's own
+# recommendation system than this content actually deserves. "default" stays
+# pointed at tech (harmless for anyone who forked this for a non-sports
+# channel and passes some other category key by mistake), but
+# publish_approved.py now explicitly passes category="sports" for this app.
 CATEGORY_MAP = {
     "tech":      "28",
     "education": "27",
     "lifestyle": "22",
+    "sports":    "17",
     "default":   "28",
 }
 
@@ -329,6 +341,45 @@ def upload_captions(video_id: str, srt_content: str, creds_override: dict = None
               f"The video itself published fine — only the real caption track is missing. "
               f"Burned-in captions are unaffected.")
         return {"status": "failed", "error": str(e)}
+
+
+def set_thumbnail(video_id: str, thumbnail_path: str, creds_override: dict = None) -> dict:
+    """Sets a video's custom thumbnail from a local image file.
+
+    REQUIRES A PHONE-VERIFIED YOUTUBE ACCOUNT. This is a YouTube account
+    restriction, not something this app can configure around: custom
+    thumbnails (and a few other features) are only available once the
+    channel's Google account has verified a phone number at
+    youtube.com/verify. An unverified channel will get a 403
+    "youtubeSignupRequired" or similar error back from this call — if that
+    happens, the video still published fine with YouTube's own
+    auto-generated thumbnail, this is just the one extra step that needs
+    that one-time verification first.
+
+    Best-effort by design, same contract as upload_captions(): called after
+    the real video upload already succeeded, so a thumbnail failure must
+    never look like the publish itself failed.
+    """
+    if not thumbnail_path or not os.path.exists(thumbnail_path):
+        return {"status": "skipped", "reason": "no thumbnail file available"}
+
+    try:
+        youtube = get_authenticated_service(creds_override)
+        media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
+        request = youtube.thumbnails().set(videoId=video_id, media_body=media)
+        request.execute()
+        print(f"[publisher] ✓ Custom thumbnail set for {video_id}")
+        return {"status": "uploaded"}
+    except Exception as e:
+        msg = str(e)
+        hint = (
+            " (this almost always means the channel's Google account needs phone "
+            "verification at youtube.com/verify — custom thumbnails require it)"
+            if "403" in msg or "verif" in msg.lower() else ""
+        )
+        print(f"[publisher] ⚠ Thumbnail upload failed for {video_id}{hint}: {e}. "
+              f"The video itself published fine with YouTube's auto-generated thumbnail.")
+        return {"status": "failed", "error": msg}
 
 
 def upload_video(

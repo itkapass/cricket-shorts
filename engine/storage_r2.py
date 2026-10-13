@@ -101,10 +101,10 @@ def _r2_public_url(key: str) -> str:
     return f"{base}/{key}"
 
 
-def _r2_upload(local_path: str, key: str, bucket: str) -> str:
+def _r2_upload(local_path: str, key: str, bucket: str, content_type: str = "video/mp4") -> str:
     client = _r2_client()
     with open(local_path, "rb") as f:
-        client.put_object(Bucket=bucket, Key=key, Body=f, ContentType="video/mp4")
+        client.put_object(Bucket=bucket, Key=key, Body=f, ContentType=content_type)
     return _r2_public_url(key)
 
 
@@ -140,11 +140,11 @@ def _sb():
     return create_client(url, key)
 
 
-def _sb_upload(local_path: str, key: str, bucket: str, db=None) -> str:
+def _sb_upload(local_path: str, key: str, bucket: str, db=None, content_type: str = "video/mp4") -> str:
     db = db or _sb()
     with open(local_path, "rb") as f:
         db.storage.from_(bucket).upload(
-            key, f, file_options={"content-type": "video/mp4", "upsert": "true"}
+            key, f, file_options={"content-type": content_type, "upsert": "true"}
         )
     return db.storage.from_(bucket).get_public_url(key)
 
@@ -208,6 +208,33 @@ def upload_video(local_path: str, job_id: str, db=None) -> str | None:
     except Exception as log_error:
         print(f"[storage] ⚠ Could not even record the upload failure: {log_error}")
     return None
+
+
+def upload_thumbnail(local_path: str, job_id: str, db=None) -> str | None:
+    """Uploads a generated thumbnail (see engine/thumbnail_generator.py) and
+    writes its URL to videos.thumbnail_url. Same backend (R2 or Supabase,
+    whichever upload_video() above is already using) and the same
+    never-raises, best-effort contract — a failed thumbnail upload should
+    cost exactly one thumbnail, never the video it belongs to.
+    """
+    if not local_path or not os.path.exists(local_path):
+        return None
+
+    bucket = get("STORAGE_BUCKET", BUCKET_DEFAULT)
+    key = f"{job_id}_thumb.jpg"
+    backend = backend_name()
+    db = db or _sb()
+
+    try:
+        url = _r2_upload(local_path, key, bucket, content_type="image/jpeg") if backend == "r2" \
+            else _sb_upload(local_path, key, bucket, db=db, content_type="image/jpeg")
+        db.table("videos").update({"thumbnail_url": url}).eq("job_id", job_id).execute()
+        print(f"[storage] ✓ Uploaded thumbnail for {job_id} to {backend} -> {url}")
+        return url
+    except Exception as e:
+        print(f"[storage] ⚠ Thumbnail upload failed for {job_id} ({e}) — "
+              f"the video itself is unaffected, it just won't have a custom thumbnail.")
+        return None
 
 
 def delete_video(job_id: str, db=None) -> bool:

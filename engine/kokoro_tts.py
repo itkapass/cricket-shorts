@@ -77,6 +77,18 @@ KOKORO_VOICE_PROFILES = {
     "warm_female":           ("am_michael", "en-us"),  # redirected to male
     "young_casual":          ("am_puck", "en-us"),
     "young_energetic_male":  ("am_puck", "en-us"),
+    # Kokoro's shipped voice pack (see the model docstring above) has no
+    # Indian-English voice at all — only American/British. "indian_male" /
+    # "indian_conversational" are handled specially in voice_engine.py
+    # (edge-tts, which DOES have a real en-IN voice, is tried first for
+    # these two profiles); this entry only exists so Kokoro still has a
+    # sane, warm fallback voice on the rare day edge-tts can't be reached,
+    # instead of silently falling through to KOKORO_VOICE_PROFILES["default"]
+    # (the formal documentary voice this fallback is specifically trying to
+    # avoid). am_michael is Kokoro's warmest, most conversational-sounding
+    # male voice — the closest available stand-in, not a pretend accent.
+    "indian_male":           ("am_michael", "en-us"),
+    "indian_conversational": ("am_michael", "en-us"),
     "default":               ("bm_george", "en-gb"),
 }
 

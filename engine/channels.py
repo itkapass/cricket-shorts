@@ -326,6 +326,90 @@ def _setting_int(key: str, default: int) -> int:
         return default
 
 
+def _setting_str(key: str, default: str, db=None) -> str:
+    try:
+        db = db or _db()
+        rows = db.table("settings").select("value").eq("key", key).execute().data or []
+        return rows[0]["value"] if rows and rows[0].get("value") not in (None, "") else default
+    except Exception:
+        return default
+
+
+IST_OFFSET_MINUTES = 5 * 60 + 30  # India Standard Time is a fixed UTC+5:30, no DST
+
+
+def _parse_peak_hours(spec: str) -> list:
+    """'7-10,12-14,18-23' -> [(7,10), (12,14), (18,23)]. Both ends inclusive,
+    hour-of-day 0-23, IST. Silently drops any range it can't parse rather
+    than raising — a typo in Settings should degrade to "no peak-hour
+    restriction", never crash publishing."""
+    ranges = []
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            lo, hi = part.split("-")
+            lo, hi = int(lo), int(hi)
+            if 0 <= lo <= 23 and 0 <= hi <= 23:
+                ranges.append((lo, hi) if lo <= hi else (hi, lo))
+        except (ValueError, AttributeError):
+            print(f"[channels] ⚠ Could not parse peak-hour range {part!r} in "
+                  f"publish_peak_hours_ist — ignoring just that one range.")
+    return ranges
+
+
+def _current_ist_hour(db=None) -> int:
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc) + timedelta(minutes=IST_OFFSET_MINUTES)).hour
+
+
+def peak_hours_status(db=None) -> tuple:
+    """(is_peak_now, human_readable_reason).
+
+    WHY THIS EXISTS: "best posting times" for an audience that is ~85%
+    Indian cricket fans means posting when THEY are actually awake and on
+    their phones — morning commute/tea time, lunch, and the evening-through-
+    late-night stretch when cricket chatter peaks (IPL/international
+    matches most often go into the evening IST) — not spread mechanically
+    across all 24 hours including 3am IST, which is when the old pure-
+    spacing math (see min_gap_minutes) was happy to post if that's simply
+    where the even gap landed.
+
+    `publish_use_peak_hours` (default on) and `publish_peak_hours_ist`
+    (default '7-10,12-14,18-23' — see migration 008) are both plain
+    Settings values, editable from the dashboard without a code change.
+    Setting `publish_use_peak_hours` to anything other than 'true' disables
+    this check entirely and restores the old pure-spacing behaviour.
+    """
+    use_peak = _setting_str("publish_use_peak_hours", "true", db=db).strip().lower() == "true"
+    if not use_peak:
+        return True, "peak-hour posting is turned off in Settings"
+
+    spec = _setting_str("publish_peak_hours_ist", "7-10,12-14,18-23", db=db)
+    ranges = _parse_peak_hours(spec)
+    if not ranges:
+        # A broken/empty setting must never silently stop every publish —
+        # fail open, the same philosophy as every other best-effort check
+        # in this project (visual_usage, duplicate_check, ...).
+        return True, "no valid peak-hour ranges configured; posting without restriction"
+
+    hour = _current_ist_hour(db=db)
+    if any(lo <= hour <= hi for lo, hi in ranges):
+        return True, f"{hour:02d}:00 IST is inside a peak window ({spec})"
+
+    # Find the next window's start hour (today, wrapping to tomorrow) purely
+    # for a friendlier log message — this does not change WHEN the next
+    # publish run actually tries again, that is still the workflow's own
+    # schedule (hourly).
+    future_starts = sorted(lo for lo, _ in ranges if lo > hour)
+    next_start = future_starts[0] if future_starts else min(lo for lo, _ in ranges)
+    return False, (
+        f"{hour:02d}:00 IST is outside the configured peak posting hours ({spec}); "
+        f"next window opens around {next_start:02d}:00 IST"
+    )
+
+
 def minutes_since_last_publish(channel_id, db=None):
     """How long since this channel last published, in minutes.
 
@@ -352,20 +436,33 @@ def minutes_since_last_publish(channel_id, db=None):
 
 
 def ready_to_publish(channel: dict, db=None) -> tuple:
-    """(is_ready, human_readable_reason). Checks spacing, not credentials."""
+    """(is_ready, human_readable_reason). Checks spacing AND peak posting
+    hours (see peak_hours_status) — not credentials, which is a separate
+    check (credentials_for) with its own failure message.
+
+    Peak-hours is checked SECOND, after spacing, on purpose: if the channel
+    isn't even due for its next post yet, that is the more useful reason to
+    show, and checking it first avoids a spurious extra settings read on
+    every run where spacing alone already says "not yet".
+    """
     gap = min_gap_minutes(channel)
     since = minutes_since_last_publish((channel or {}).get("id"), db=db)
+    if since is not None and since < gap:
+        wait = int(gap - since)
+        hrs, mins = divmod(wait, 60)
+        pretty = f"{hrs}h {mins}m" if hrs else f"{mins}m"
+        return False, (
+            f"last upload was only {int(since)} min ago; this channel posts one "
+            f"every {gap} min. Next slot in {pretty}."
+        )
+
+    is_peak, peak_reason = peak_hours_status(db=db)
+    if not is_peak:
+        return False, peak_reason
+
     if since is None:
-        return True, "no previous upload on this channel"
-    if since >= gap:
-        return True, f"last upload was {int(since)} min ago (gap is {gap} min)"
-    wait = int(gap - since)
-    hrs, mins = divmod(wait, 60)
-    pretty = f"{hrs}h {mins}m" if hrs else f"{mins}m"
-    return False, (
-        f"last upload was only {int(since)} min ago; this channel posts one "
-        f"every {gap} min. Next slot in {pretty}."
-    )
+        return True, f"no previous upload on this channel — {peak_reason}"
+    return True, f"last upload was {int(since)} min ago (gap is {gap} min) — {peak_reason}"
 
 
 def describe(channel: dict) -> str:

@@ -63,6 +63,7 @@ from engine import api_budget
 from engine import llm_router
 from engine import research as research_mod
 from engine import engagement
+from engine import personas as personas_mod
 
 # gemini-1.5-flash (the previous hardcoded value) is almost certainly
 # retired by now — Google moved the Flash line through 2.0 -> 2.5 -> 3.x,
@@ -108,7 +109,7 @@ class _ModelResponse:
 
 
 def _get_client(api_key: str = None):
-    """Returns (client, model_name).
+    """Returns (client, model_name, resolved_key).
 
     `api_key`, when given, overrides the global GEMINI_API_KEY. This is what
     makes per-channel Gemini keys work: each Google account gets its own
@@ -117,6 +118,11 @@ def _get_client(api_key: str = None):
     Get one free at aistudio.google.com with a different Google account, then
     set GEMINI_API_KEY_<SUFFIX> the same way YOUTUBE_CLIENT_ID_<SUFFIX>
     already works for multi-channel YouTube credentials (see docs/07).
+
+    `resolved_key` (new) is the actual key string this call ended up using —
+    returned so a caller can tell _call_model_with_clear_errors which key to
+    skip when it tries the GEMINI_API_KEY_POOL (see _gemini_key_pool below)
+    after a daily-quota 429, instead of retrying the same exhausted key.
 
     NOTE — this project previously used the `google.generativeai` package,
     which — as of testing this fix — prints: 'All support for the
@@ -136,10 +142,34 @@ def _get_client(api_key: str = None):
     # exists right now means that failure mode is gone for good.
     # Setting GEMINI_MODEL still pins a specific name and skips discovery.
     model_name = model_registry.choose_text_model(key) or DEFAULT_GEMINI_MODEL
-    return client, model_name
+    return client, model_name, key
 
 
-def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature=None):
+def _gemini_key_pool() -> list:
+    """Extra Gemini API keys to try, in order, after the PRIMARY
+    GEMINI_API_KEY hits its own daily quota -- before giving up on Gemini
+    entirely for this call and falling through to the Groq/GitHub Models
+    backup chain.
+
+    WHY THIS EXISTS: each Google account's free Gemini key gets its own
+    independent ~20 requests/day quota (see _get_client above). This app can
+    easily use more than that for a single day's video batch once you count
+    the creative brief, the script, and the per-scene visual-relevance
+    ranking calls -- so without this, every video after roughly the 2nd or
+    3rd of the day quietly falls back to Groq, even on a day where Gemini
+    itself is working fine. One more free key (sign up again at
+    aistudio.google.com with a different Google account -- 2 minutes, no
+    cost) effectively doubles that day's Gemini budget.
+
+    Configure by setting GEMINI_API_KEY_POOL to a comma-separated list of
+    additional keys, e.g. GEMINI_API_KEY_POOL="key_two,key_three". Entirely
+    optional -- an unset/empty pool changes nothing about today's behavior.
+    """
+    raw = get("GEMINI_API_KEY_POOL", "") or ""
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature=None, current_key=None):
     """Calls Gemini and retries transient failures.
 
     TEMPERATURE, EXPLAINED (you asked to learn real AI-engineering concepts —
@@ -239,7 +269,36 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
                     time.sleep(wait)
                     continue
 
-                # Genuine daily exhaustion. Try every configured free
+                # Try any additional keys in GEMINI_API_KEY_POOL before
+                # treating this as a full-stop Gemini exhaustion for the
+                # day -- see _gemini_key_pool()'s docstring. Each pooled key
+                # has its own independent daily quota, so this is what turns
+                # "every video today used Groq" into "most videos still got
+                # a genuine Gemini script" once a second free key is added.
+                pool_keys = [k for k in _gemini_key_pool() if k != current_key]
+                for pool_key in pool_keys:
+                    try:
+                        pool_client = genai.Client(api_key=pool_key)
+                        pool_resp = pool_client.models.generate_content(
+                            model=model_name, contents=user_prompt,
+                            config=types.GenerateContentConfig(
+                                system_instruction=system_prompt,
+                                response_mime_type="application/json",
+                                temperature=temperature, top_p=0.95,
+                            ),
+                        )
+                        if pool_resp.text and pool_resp.text.strip():
+                            print(f"[script_generator] A GEMINI_API_KEY_POOL key answered "
+                                  f"after the primary key's daily quota ran out -- still "
+                                  f"tagged 'gemini', not a backup provider.")
+                            return _ModelResponse(pool_resp.text, "gemini")
+                    except Exception as pool_err:
+                        print(f"[script_generator] A pooled Gemini key also failed "
+                              f"({pool_err}); trying the next one.")
+                        continue
+
+                # Genuine daily exhaustion (primary key, and every pooled
+                # GEMINI_API_KEY_POOL key, if any, are also out). Try every configured free
                 # backup, in order (Groq, then GitHub Models — see
                 # llm_router.py), before giving up.
                 backup_failure_detail = None
@@ -324,6 +383,48 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
                 ) from e
             raise
     raise last_error
+
+
+_REFUSAL_MARKERS = (
+    "i'm sorry", "i am sorry", "sorry, but i", "sorry but i",
+    "i cannot", "i can't fulfill", "i can't help with",
+    "i cannot help with", "i won't be able to", "as an ai",
+    "i'm not able to", "i am not able to", "i can't assist",
+    "i cannot assist", "i can't provide", "i cannot provide",
+    "i'm unable to", "i am unable to", "unable to help with",
+    "not something i can help with",
+)
+
+
+def _looks_like_refusal(raw: str) -> bool:
+    """True if `raw` reads like a model declining the topic in plain prose,
+    rather than JSON that merely failed to parse — these are two genuinely
+    different situations (see the long comment where this used to be
+    inlined, in the Gemini JSON-parsing loop below) that both used to
+    produce the identical, confusing "invalid JSON" message.
+
+    FIXED: this check originally only ran on GEMINI's own output. A backup
+    provider (Groq/GitHub Models — see llm_router.py) can refuse a topic
+    exactly the same way Gemini can, and when that happened the backup path
+    just saw a JSONDecodeError and reported "every configured backup
+    provider also failed" with no indication it was actually a refusal, not
+    a formatting glitch — so a topic that every configured provider
+    declined kept getting retried every run, forever, as if it were a
+    one-off hiccup. Pulling this into one shared function and calling it on
+    BOTH the primary and the backup provider's raw text closes that gap.
+    """
+    stripped = (
+        (raw or "").strip().lower()
+        .replace("’", "'").replace("‘", "'")
+        .replace("ʼ", "'").replace("`", "'")
+        .lstrip("﻿​‌‍ \"'“”*-\n\t")
+    )
+    opening = stripped[:80]
+    return (
+        len(raw or "") < 300
+        and not (raw or "").lstrip().startswith(("{", "["))
+        and any(m in opening for m in _REFUSAL_MARKERS)
+    )
 
 
 # ─── Prompt Templates ────────────────────────────────────────────────────────
@@ -449,6 +550,23 @@ def _build_system_prompt(render_style: str, num_scenes: int, archetype: str = No
     ]))
 
     archetype_block = arch.prompt_block(archetype) if archetype else ""
+    # FIXED: the persona's own writing-voice instructions (personas.py's
+    # flavor_instructions — "write like a friend over chai, not a report")
+    # used to only reach the SEPARATE creative-brief call (see brief.py),
+    # which then had to compress it down into its own one-line "tone_note"
+    # for THIS prompt to see — a real game of telephone between "don't sound
+    # elite/corporate" and whatever one sentence the brief model chose to
+    # keep. Pulling the persona key back off the brief (brief.py sets
+    # `_persona` on every brief it writes) and inserting the FULL voice
+    # instructions directly into the prompt that actually writes voice_text
+    # is what closes that gap — this is the literal fix for "the wording
+    # said in the video are too elite, needs to be conveyed like a friend
+    # saying a fact".
+    persona_key_for_voice = (creative_brief or {}).get("_persona")
+    persona_voice_block = (
+        "\n" + personas_mod.flavor_prompt_block(persona_key_for_voice)
+        if persona_key_for_voice else ""
+    )
     brief_block = brief_mod.prompt_block(creative_brief) if creative_brief else ""
     # Research notes were fetched once, in brief.py, and carried on the brief
     # dict as `_research_notes` so a second Wikipedia round-trip is never
@@ -480,7 +598,7 @@ You are an experienced short-form video scriptwriter for YouTube Shorts. Your
 goal is genuine viewer retention: specific, well-earned writing that rewards
 someone for watching to the end — not filler, and not hollow engagement bait.
 
-{brief_block}{archetype_block}{research_block}{quiz_close_block}{structure_block}{avoid_block}
+{persona_voice_block}{brief_block}{archetype_block}{research_block}{quiz_close_block}{structure_block}{avoid_block}
 
 RULES:
 1. TOTAL NARRATION: 40-50 seconds read aloud (roughly 110-140 spoken words
@@ -499,10 +617,24 @@ RULES:
    5 words on throat-clearing. Avoid these openers entirely: "Did you
    know...", "Here's something crazy...", "You won't believe...", "Let me
    tell you about..." — all four delay the actual hook by a full clause.
-3. PACING: every scene is punchy (1-2 sentences max). Cut every unnecessary word.
+3. PACING AND VOICE: every scene is punchy (1-2 sentences max). Cut every
+   unnecessary word. SAY IT THE WAY A PERSON ACTUALLY TALKS — picture
+   explaining this one fact out loud to a friend who's into cricket, or the
+   way a good teacher tells a class a bit of history: plain, warm, a little
+   excited. NOT the way a press release or a Wikipedia article says it. Read
+   every line back and ask "would I actually say this sentence out loud to a
+   friend?" — if the honest answer is no, rewrite it simpler. Concretely:
+   never use "utilize" (say "use"), "significant" (say "big" or "huge"),
+   "demonstrate"/"exhibit" (say "show"), "subsequently"/"thereafter" (say
+   "then"), "in conclusion"/"to summarize" (just end the sentence),
+   "numerous" (say "a lot of" or a real number), "individual" as a noun for
+   a person (say "player" or their name), "endeavor" (say "try"), or any
+   other word that sounds like a report instead of a conversation. Short
+   sentences beat long ones. Contractions are good, not sloppy ("didn't",
+   "it's", "that's"). This rule applies to EVERY scene, not just the hook.
 4. ENDING (scene {num_scenes}): this is NOT optional — the final scene's
    voice_text MUST end with one short, natural sentence that does ONE of
-   these four things (rotate which one across videos, do not default to
+   these five things (rotate which one across videos, do not default to
    the same type every time):
      a) asks a specific follow-up question tied to THIS fact (e.g. "now
         guess which rule costs even more runs — comment your answer")
@@ -513,11 +645,14 @@ RULES:
         nobody explains properly")
      d) a direct share line tied to this specific fact (e.g. "send this
         to the one friend who'll argue it's wrong")
+     e) a direct, honest like-ask tied to this specific fact (e.g. "if
+        that blew your mind too, smash that like button" or "hit like if
+        you didn't know that one") — plain and genuine, never robotic
    Never invent the exact same sentence twice — vary the wording every
    time. Do not use empty engagement-bait instructions like "comment X
    and I'll DM you" — YouTube's spam policies discourage this, and it
    reads as hollow to viewers anyway. A video that ends on the fact alone,
-   with no (a/b/c/d) line, is incomplete — do not do this.
+   with no (a/b/c/d/e) line, is incomplete — do not do this.
 {visual_rule}
 6. Do not state invented statistics or claims about real, named companies or
    people as fact unless they're well-established public knowledge — a
@@ -609,7 +744,7 @@ def generate_custom_storyboard(
     if render_style not in available_styles():
         render_style = "stock_footage"
 
-    client, model_name = _get_client(api_key)
+    client, model_name, resolved_key = _get_client(api_key)
     system_prompt = _build_system_prompt(render_style, num_scenes, archetype, avoid_list,
                                         structure, creative_brief)
     # An explicit caller-supplied temperature (usually a persona's own
@@ -647,7 +782,8 @@ Generate a {num_scenes}-scene storyboard adhering strictly to the JSON schema.
     used_provider = "gemini"
 
     for json_attempt in range(1, MAX_JSON_RETRIES + 1):
-        response = _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature)
+        response = _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature,
+                                                   current_key=resolved_key)
         try:
             raw = response.text.strip()
             raw = re.sub(r"^```json\s*", "", raw)
@@ -674,27 +810,10 @@ Generate a {num_scenes}-scene storyboard adhering strictly to the JSON schema.
             # sorry," would each silently defeat it the same way. Checking
             # for these phrases ANYWHERE in the first ~80 characters, after
             # stripping junk, is far more robust than requiring an exact
-            # prefix match.
-            stripped = (
-                raw.strip().lower()
-                .replace("\u2019", "'").replace("\u2018", "'")
-                .replace("\u02bc", "'").replace("`", "'")
-                .lstrip("\ufeff\u200b\u200c\u200d \"'\u201c\u201d*-\n\t")
-            )
-            opening = stripped[:80]
-            refusal_markers = ("i'm sorry", "i am sorry", "sorry, but i", "sorry but i",
-                               "i cannot", "i can't fulfill", "i can't help with",
-                               "i cannot help with", "i won't be able to", "as an ai",
-                               "i'm not able to", "i am not able to", "i can't assist",
-                               "i cannot assist", "i can't provide", "i cannot provide",
-                               "i'm unable to", "i am unable to", "unable to help with",
-                               "not something i can help with")
-            looks_like_refusal = (
-                len(raw) < 300
-                and not raw.lstrip().startswith(("{", "["))
-                and any(m in opening for m in refusal_markers)
-            )
-            if looks_like_refusal:
+            # prefix match. (See _looks_like_refusal's own docstring above —
+            # this used to be inlined here only; it is now shared with the
+            # backup-provider path below.)
+            if _looks_like_refusal(raw):
                 # Retrying won't change the model's mind about the topic —
                 # fail immediately rather than burning more attempts/quota.
                 raise ValueError(
@@ -723,10 +842,29 @@ Generate a {num_scenes}-scene storyboard adhering strictly to the JSON schema.
             try:
                 backup_text, used_provider = llm_router.call(system_prompt, user_prompt, temperature)
                 backup_text = backup_text.strip()
+                # FIXED: a backup provider can decline a topic in plain prose
+                # exactly the way Gemini can (see _looks_like_refusal's
+                # docstring) — check for that BEFORE attempting json.loads,
+                # so this is reported as a clear refusal rather than falling
+                # through to a confusing "malformed JSON" message that would
+                # have left this topic looking like a transient glitch worth
+                # retrying forever, instead of something to retire.
+                if _looks_like_refusal(backup_text):
+                    raise ValueError(
+                        f"Backup provider '{used_provider}' also declined to write this "
+                        f"topic (not a JSON/formatting problem): {backup_text[:300]!r}\n\n"
+                        f"Both Gemini and the backup provider judged this topic/tone "
+                        f"combination unsuitable. If this keeps happening for the same "
+                        f"topic, retire it in Topic Studio rather than retrying — a refusal "
+                        f"is a judgment call, not a transient error, and won't be fixed by "
+                        f"trying again."
+                    )
                 backup_text = re.sub(r"^```json\s*", "", backup_text)
                 backup_text = re.sub(r"\s*```$", "", backup_text)
                 storyboard = json.loads(backup_text)
                 print(f"[script_generator] \u2713 Backup provider '{used_provider}' returned valid JSON.")
+            except ValueError:
+                raise  # a detected refusal — propagate as-is, don't relabel it below
             except Exception as backup_err:
                 e, raw_snippet = last_json_error
                 raise ValueError(
@@ -861,18 +999,29 @@ def rank_visual_candidates(scene_text: str, keyword: str, candidates: list, api_
     Called by visual_fetcher for every scene with more than one candidate. It
     exists because reviewing real output found a data-centre video illustrated
     with a derelict warehouse and a supercomputer scene illustrated with a
-    Spanish emergency-stop button — Pexels returned loosely-matching results
+    Spanish emergency-stop button -- Pexels returned loosely-matching results
     and the old code picked at RANDOM from them.
 
-    One cheap text call, no image analysis, comfortably inside the free tier.
+    PROVIDER CHOICE, CHANGED: this used to always call Gemini, exactly like
+    the brief and the script. In practice that meant the same small ~20/day
+    Gemini quota (see _get_client's docstring) was being spent on "which
+    stock clip best fits this line" almost as often as on the actual words
+    of the video -- a typical video has several scenes that reach this
+    function, so by the time video #2 or #3 of the day needed its SCRIPT
+    written, Gemini's quota for the day was already gone and every script
+    from then on fell back to Groq, even on a day where nothing was actually
+    wrong. This ranking task is a simple, low-stakes classification job that
+    doesn't need Gemini's specific strengths, so it now tries the Groq/
+    GitHub Models backup chain FIRST (1,000 free requests/day on Groq alone
+    -- effectively unlimited for a job this size) and only falls through to
+    Gemini if no backup provider is configured at all. That keeps the
+    precious Gemini quota for the one job that actually benefits from it:
+    writing the video.
+
     Returns [] on any failure so the caller keeps the original order.
     """
-    if not candidates:
-        return []
-    try:
-        client, model_name = _get_client(api_key)
-    except Exception:
-        return []
+    if len(candidates) < 2:
+        return candidates
 
     listing = "\n".join(
         f"{i}. {c.get('description') or 'untitled clip'} "
@@ -889,12 +1038,31 @@ def rank_visual_candidates(scene_text: str, keyword: str, candidates: list, api_
     )
     user = f"NARRATION: {scene_text}\nSEARCH TERM USED: {keyword}\n\nCLIPS:\n{listing}"
 
-    try:
-        response = _call_model_with_clear_errors(client, model_name, system, user)
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.text.strip())
+    def _parse_order(raw_text: str):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip())
         order = json.loads(raw)
         if isinstance(order, list) and all(isinstance(i, int) for i in order):
             return order
+        return []
+
+    if llm_router.any_backup_available():
+        try:
+            text, provider_name = llm_router.call(system, user, temperature=0.4)
+            order = _parse_order(text)
+            if order:
+                return order
+        except Exception as e:
+            print(f"[script_generator] Backup-provider visual ranking failed ({e}); "
+                  f"trying Gemini instead.")
+
+    try:
+        client, model_name, resolved_key = _get_client(api_key)
+    except Exception:
+        return []
+    try:
+        response = _call_model_with_clear_errors(client, model_name, system, user,
+                                                   current_key=resolved_key)
+        return _parse_order(response.text)
     except Exception as e:
         print(f"[script_generator] \u26a0 Visual ranking failed ({e}); keeping search order.")
     return []

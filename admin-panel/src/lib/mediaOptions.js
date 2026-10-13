@@ -19,6 +19,7 @@
 
 export const VOICES = [
   ['', 'Use the channel\u2019s persona default (male)'],
+  ['indian_male', 'Indian English — male (Prabhat) — recommended for this audience'],
   ['documentary_male', 'Documentary — male (Guy)'],
   ['conversational', 'Conversational — male (Andrew)'],
   ['energetic', 'Energetic — male (Christopher)'],

@@ -358,8 +358,9 @@ Sport: {sport}
 Invent {n} genuinely different follow-up topics, same category and sport,
 that were NOT already covered by the original."""
 
-    client, model_name = _get_client(api_key)
-    response = _call_model_with_clear_errors(client, model_name, FOLLOW_UP_SYSTEM, user, temperature=0.9)
+    client, model_name, resolved_key = _get_client(api_key)
+    response = _call_model_with_clear_errors(client, model_name, FOLLOW_UP_SYSTEM, user, temperature=0.9,
+                                               current_key=resolved_key)
     ideas = _extract_json_array(response.text)
     return [
         {"name": i["name"].strip(), "description": i.get("description", "").strip(),

@@ -55,7 +55,17 @@ PERSONAS = {
             "business_and_governance", "informative", "myth_busting",
         ],
         "preferred_render_style": "sports_visual",
-        "preferred_voice": "documentary_male",
+        # FALLBACK ONLY — not a pin. This used to be read as if it were a
+        # fixed, unconditional voice for every single video this persona
+        # makes (orchestrator.py checked it BEFORE the tone-based
+        # voice_profile_for_tone() lookup), which is the actual reason every
+        # video sounded identical regardless of the Settings dropdown or the
+        # video's own tone: this one value always won. orchestrator.py now
+        # checks the tone-based mapping FIRST and only falls back to this
+        # value for a tone it doesn't recognise — so this is now genuinely a
+        # fallback, and real per-tone variety (see voice_engine.py's
+        # TONE_VOICE_MAP) is what actually plays on most videos.
+        "preferred_voice": "indian_male",
         "default_temperature": 0.8,
         "flavor_instructions": (
             "This channel lives or dies on being genuinely, verifiably correct about real "
@@ -75,7 +85,16 @@ PERSONAS = {
             "For records_and_stats and quiz_challenge videos specifically: the closing "
             "engagement question (engine/engagement.py) is not optional decoration — it is "
             "the single biggest lever this channel has for comments and shares, so give it "
-            "genuine thought every time rather than a token afterthought."
+            "genuine thought every time rather than a token afterthought.\n"
+            "WRITE LIKE A PERSON TALKING, NOT A REPORT. This channel's audience is mostly "
+            "everyday cricket fans in India, not sports journalists. Say it the way a friend "
+            "who follows cricket closely would tell you a great fact over chai, or the way a "
+            "good teacher explains a bit of history — plain, warm, a little excited, never "
+            "stiff or 'textbook'. Avoid formal/academic/corporate words entirely (e.g. "
+            "'utilize', 'significant', 'demonstrate', 'subsequently', 'in conclusion') — use "
+            "the simple everyday word instead ('use', 'big', 'show', 'then'). Short sentences. "
+            "Contractions are fine and usually better ('didn't', 'it's'). If a word wouldn't "
+            "come up in a normal conversation at a cricket ground, don't use it here."
         ),
     },
 }

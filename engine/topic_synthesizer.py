@@ -245,8 +245,9 @@ Invent exactly {n} new topics, one per lens, in order."""
         budget.require(1, f"topic synthesis for '{persona_key}'")
 
     try:
-        client, model_name = _get_client(api_key)
-        response = _call_model_with_clear_errors(client, model_name, SYNTH_SYSTEM, user, temperature=1.0)
+        client, model_name, resolved_key = _get_client(api_key)
+        response = _call_model_with_clear_errors(client, model_name, SYNTH_SYSTEM, user, temperature=1.0,
+                                                   current_key=resolved_key)
         if budget is not None:
             budget.spend(1)
         ideas = _extract_json_array(response.text)

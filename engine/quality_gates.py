@@ -36,7 +36,37 @@ VERDICTS
   pass    — send to human review
   warn    — send to human review, flagged, with the reason shown in the queue
   reject  — do not show a human, do not publish, log why
+
+AUTO-APPROVE AND "warn", FIXED
+Every "warn" used to block auto-approve equally — see orchestrator.py's
+_save_and_finalize(). That sounds safe, but in practice it made Auto-Approve
+dead on arrival: Kokoro is this build's PRIMARY voice engine (see
+voice_engine.py), Kokoro never reports exact word timing, and the
+"caption_timing" check below fires a "warn" on EVERY video that isn't
+voiced by edge-tts specifically — which, by design, is most of them. So a
+channel with Auto-Approve switched on in Settings still saw almost every
+video land in Pending Review anyway, with no visible reason why the toggle
+"wasn't working" — it was working exactly as written, the written behaviour
+was just wrong once Kokoro became the expected common case instead of a
+rare fallback.
+
+Each check below now carries a `blocks_auto_approve` flag (see `add()`).
+`caption_timing` is the one check set to NOT block — it is expected,
+by-design behaviour for most videos on this build, not a defect, and
+voice_engine.py's own docstring already explains why the timing is still
+accurate enough for on-screen captions (~80ms/word). Every warning that
+genuinely indicates something might be wrong with THIS video specifically —
+audio level, a frozen frame, a missing closing CTA, a cross-sport visual
+mismatch, an off-aspect-ratio render — still blocks auto-approve and routes
+to a human, unchanged. See `has_blocking_warnings()` below, which is what
+orchestrator.py now actually calls instead of checking `verdict == "warn"`.
 """
+
+# Warning check NAMES that are expected/by-design given this build's own
+# architecture rather than a sign anything is wrong with this specific
+# video — see the module docstring above. Every other "warn" still blocks
+# auto-approve.
+NON_BLOCKING_WARNING_CHECKS = {"caption_timing"}
 import json
 import os
 import subprocess
@@ -111,7 +141,8 @@ def run_gates(video_path: str, storyboard: dict = None, expect_audio: bool = Tru
     file), the verdict is "warn" and the video still reaches a human. A broken
     checker must not silently discard good videos.
     """
-    result = {"verdict": "pass", "checks": [], "failures": [], "warnings": []}
+    result = {"verdict": "pass", "checks": [], "failures": [], "warnings": [],
+              "blocking_warnings": []}
 
     def add(name, ok, level, detail=""):
         result["checks"].append({"name": name, "ok": bool(ok), "detail": detail})
@@ -120,6 +151,8 @@ def run_gates(video_path: str, storyboard: dict = None, expect_audio: bool = Tru
                 result["failures"].append(f"{name}: {detail}")
             else:
                 result["warnings"].append(f"{name}: {detail}")
+                if name not in NON_BLOCKING_WARNING_CHECKS:
+                    result["blocking_warnings"].append(f"{name}: {detail}")
 
     if not os.path.exists(video_path):
         result["verdict"] = "reject"
@@ -230,7 +263,12 @@ def run_gates(video_path: str, storyboard: dict = None, expect_audio: bool = Tru
         if scenes:
             last_voice_text = (scenes[-1].get("voice_text") or "").strip().lower()
             cta_markers = ("?", "follow", "subscribe", "comment", "share", "send this",
-                           "part 2", "next time", "miss it", "don't miss")
+                           "part 2", "next time", "miss it", "don't miss",
+                           # Added alongside script_generator.py's new ending option (e) —
+                           # a direct like-ask ("smash that like button", "hit like if...")
+                           # is a real, valid closing CTA and was wrongly flagged "missing"
+                           # by this check before "like" was added here.
+                           "like")
             has_cta = any(m in last_voice_text for m in cta_markers)
             add("closing_cta", has_cta, "warn",
                 "the final scene doesn't end with a question, follow/subscribe/share "
@@ -275,6 +313,16 @@ def run_gates(video_path: str, storyboard: dict = None, expect_audio: bool = Tru
         result["verdict"] = "warn"
 
     return result
+
+
+def has_blocking_warnings(result: dict) -> bool:
+    """True if this video has at least one warning that should stop
+    auto-approve and route it to a human — i.e. anything other than the
+    expected, by-design "warn"s listed in NON_BLOCKING_WARNING_CHECKS. A
+    "reject" verdict already stops the video earlier in orchestrator.py and
+    never reaches this check at all; this is specifically for the "warn"
+    case, where the old code treated every warning as equally blocking."""
+    return bool(result.get("blocking_warnings"))
 
 
 def summarize(result: dict) -> str:
