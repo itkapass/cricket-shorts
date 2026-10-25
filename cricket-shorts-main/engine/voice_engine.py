@@ -1,0 +1,681 @@
+"""
+voice_engine.py
+---------------
+MODULE 2 — Text-to-Speech + word-level timing
+
+REWRITTEN. The old version generated audio with edge-tts, then transcribed that
+audio back with Whisper to find out when each word was spoken. That is a round
+trip through a speech recogniser to recover information we already had, and it
+caused three of the five defects visible in the sample videos:
+
+  - "186 ,000" and "high -performance" — Whisper returns tokens split on its
+    own rules, so numbers and hyphenated words came back as separate pieces and
+    the caption builder joined them with a space.
+  - "fabs" transcribed as "phabs" — the tiny model guessing at a word it had
+    never heard, and the wrong guess going straight onto the screen.
+  - Scene timing drift — an alignment pass with difflib existed purely to
+    reconcile the script we sent against the transcript that came back.
+
+edge-tts already emits a WordBoundary event for every word as it synthesises,
+carrying an exact offset and duration in 100-nanosecond ticks. That is ground
+truth from the synthesiser: the words are the ones we sent, spelled how we sent
+them, timed to the audio being produced. Using it removes the misheard words,
+the punctuation splits, the alignment code, AND the Whisper dependency — which
+also cuts roughly 40 seconds and a 75 MB model download off every render.
+
+FALLBACK CHAIN (reordered for this build — see engine/kokoro_tts.py)
+edge-tts is an unofficial wrapper around Microsoft Edge's read-aloud feature,
+and it is rate-limited/blocked from many datacenter IP ranges (GitHub Actions
+runners included) — confirmed directly while building this project. Its
+fallback used to be gTTS, which has NO male-voice option at all, so any day
+edge-tts had a bad day, a channel that was told "male voice everywhere" got
+a female voice anyway with no warning. This build puts a fully offline,
+always-male engine FIRST instead:
+
+  1. Kokoro    — offline neural TTS (MIT), no network call, always a real
+                 male voice. PRIMARY. Timings are estimated (see below).
+  2. edge-tts  — tried next for its EXACT per-word timing when the network
+                 cooperates; restricted to male voice IDs only.
+  3. Piper     — a second offline option if Kokoro's model download fails.
+                 Timings are estimated from the text since Piper does not
+                 emit boundaries; slightly less precise, entirely reliable.
+  4. gTTS      — absolute last resort, and the ONLY engine in this chain
+                 with no male-voice control at all. Reaching this triggers
+                 a loud alert rather than silently shipping a female voice.
+
+The pipeline never stops because one free service had a bad day.
+"""
+import asyncio
+import json
+import os
+import re
+import shutil
+import subprocess
+
+import os
+import sys
+
+# Allow BOTH `python -m engine.publisher --setup` (correct) and
+# `python engine/publisher.py --setup` (what people naturally type).
+# Running a file directly puts engine/ on sys.path instead of the project root,
+# so `from engine.config import ...` fails with ModuleNotFoundError. Adding the
+# project root here makes the natural command work too, because telling a
+# beginner "you typed it wrong" is a worse answer than making both work.
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from engine.config import get
+
+# ─── Voice Profiles ──────────────────────────────────────────────────────────
+VOICE_PROFILES = {
+    "documentary_male":   "en-US-GuyNeural",
+    "documentary_female": "en-US-JennyNeural",
+    "conversational":     "en-US-AndrewNeural",
+    "energetic":          "en-US-ChristopherNeural",
+    "british_calm":       "en-GB-RyanNeural",
+    "warm_female":        "en-US-AriaNeural",
+    # BUGFIX: this was "en-US-AnaNeural" — a young FEMALE/child voice.
+    # kokoro_tts.py's own KOKORO_VOICE_PROFILES already redirects
+    # "young_casual" to a male voice (am_puck) specifically because of the
+    # standing "male voice everywhere" instruction, but this primary
+    # edge-tts map was never actually brought in line with that — so a
+    # video spoken by edge-tts (the common case) still got a female voice
+    # under this profile, and only a video that happened to fall back to
+    # Kokoro got corrected. Redirected the same way Kokoro's map already
+    # was, so BOTH engines agree now, not just the fallback one.
+    "young_casual":       "en-US-DavisNeural",
+    # NEW: an explicit option for livelier, younger-sounding narration,
+    # still male per the standing instruction. Worth A/B testing against
+    # "documentary_male" / "energetic" rather than assumed better — voice
+    # character is subjective, Microsoft's own persona labels are a
+    # starting point, not a guarantee of how it lands with your audience.
+    "young_energetic_male": "en-US-JasonNeural",
+    # NEW: a real Indian-English Microsoft neural voice. Added because this
+    # channel's audience is ~85% cricket-focused and overwhelmingly Indian —
+    # a flat American/British accent reads as a step removed from the
+    # audience, and is one of the reasons short-form viewers bail in the
+    # first few seconds. See INDIAN_ACCENT_PROFILES below and
+    # kokoro_tts.py's KOKORO_VOICE_PROFILES for how this is kept reachable
+    # even on a day edge-tts's network call fails.
+    "indian_male":         "en-IN-PrabhatNeural",
+    "indian_conversational": "en-IN-PrabhatNeural",
+    "default":            "en-US-GuyNeural",
+}
+
+# Profiles that specifically need an Indian-accented voice to deliver what
+# was actually asked for. edge-tts is the ONLY engine in this project's
+# chain that has a real Indian-English voice at all (Kokoro's model pack is
+# American/British only — see kokoro_tts.py's KOKORO_VOICE_PROFILES) so for
+# these profiles ONLY, edge-tts is tried FIRST instead of Kokoro, accepting
+# the small extra reliability risk (edge-tts can be rate-limited on
+# datacenter IPs — see this module's own docstring) in exchange for actually
+# getting the requested accent on a normal day. Every OTHER profile keeps
+# Kokoro first, unchanged, for the reliability reasons already documented
+# above.
+INDIAN_ACCENT_PROFILES = {"indian_male", "indian_conversational"}
+
+# Per-character voices for the character_skit style. Two characters talking in
+# the same voice is instantly confusing, so each cast member gets its own.
+CHARACTER_VOICES = {
+    "capy":  "en-US-AndrewNeural",
+    "cat":   "en-US-AnaNeural",
+    "bird":  "en-GB-RyanNeural",
+    "stick": "en-US-ChristopherNeural",
+    "suit":  "en-US-GuyNeural",
+}
+
+# Maps each of this app's 5 tones (see schema.sql's seeded `tones` rows) to
+# the voice profile that actually suits its delivery style — "Mind-Blowing
+# Facts" lands better punchy and confident than calm and measured, while
+# "Documentary Narrator" is explicitly asking for the opposite. This is
+# what makes voice choice content-aware rather than one fixed voice for
+# every video a channel makes, regardless of what that video actually is.
+# Case-insensitive, matched by substring so a renamed/custom tone with
+# similar wording still resolves sensibly instead of silently missing.
+TONE_VOICE_MAP = [
+    # (substring to look for in the tone name, voice profile)
+    ("mind-blowing", "energetic"),
+    ("mind blowing", "energetic"),
+    ("sarcastic",     "conversational"),
+    ("genuine advice", "indian_conversational"),
+    ("advice",        "indian_conversational"),
+    ("short story",   "young_energetic_male"),
+    ("story",         "young_energetic_male"),
+    # "Documentary Narrator" tone used to map to the deep, formal
+    # "documentary_male" voice (Guy) — exactly the "robotic, a bit elite"
+    # voice feedback kept coming back about. documentary content on this
+    # channel still benefits from sounding grounded and credible, but that
+    # does not require sounding like a nature-channel narrator — a warm
+    # Indian-accented voice reads as more like someone explaining real
+    # cricket history to you, which is the actual goal here.
+    ("documentary",   "indian_male"),
+]
+
+
+def voice_profile_for_tone(tone_name: str) -> str | None:
+    """Best voice profile for a given tone name, or None if nothing matches
+    (caller falls through to its own default — this never invents a guess
+    for a tone it doesn't recognize).
+
+    Deliberately a pure function with no Supabase/network access: callers
+    already have the tone name in hand from the row they are processing, so
+    this only ever needs to do a plain string match, no I/O to fail on.
+    """
+    if not tone_name:
+        return None
+    needle = tone_name.strip().lower()
+    for substr, profile in TONE_VOICE_MAP:
+        if substr in needle:
+            return profile
+    return None
+
+
+TICKS_PER_SECOND = 10_000_000  # edge-tts reports offsets in 100ns ticks
+
+
+def _require_ffmpeg():
+    """ffmpeg is needed later by MoviePy for the final encode. Checking here,
+    at the very start of the pipeline, means a missing install fails in one
+    second with a clear message instead of after several minutes of work."""
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "ffmpeg was not found on your PATH. MoviePy needs the real ffmpeg program, "
+            "not just a Python package.\n"
+            "  Windows: winget install ffmpeg   (then OPEN A NEW terminal — PATH changes "
+            "do not apply to windows that were already open)\n"
+            "  macOS:   brew install ffmpeg\n"
+            "  Linux:   sudo apt-get install ffmpeg\n"
+            "Verify with: ffmpeg -version\n"
+            "You do not need this at all if you render on GitHub Actions — see docs/04."
+        )
+
+
+# ─── Engine 1: edge-tts with real word boundaries ────────────────────────────
+
+
+async def _edge_tts_with_timings(text: str, voice_id: str, output_path: str):
+    """Synthesises audio and collects WordBoundary events in one pass.
+
+    Streaming rather than calling .save() is what makes the timings available:
+    .save() discards the metadata events, which is why the original code had to
+    reach for Whisper to get them back.
+    """
+    import edge_tts
+
+    communicate = edge_tts.Communicate(text, voice_id)
+    words = []
+    with open(output_path, "wb") as f:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                start = chunk["offset"] / TICKS_PER_SECOND
+                dur = chunk["duration"] / TICKS_PER_SECOND
+                words.append({
+                    "word": chunk["text"],
+                    "start": round(start, 3),
+                    "end": round(start + dur, 3),
+                })
+    return words
+
+
+def _try_edge_tts(text, voice_id, output_path, attempts=5):
+    """Tries edge-tts, retrying transient failures before giving up.
+
+    Retries matter specifically in GitHub Actions: edge-tts is an unofficial
+    wrapper around Microsoft's read-aloud service, and Microsoft rate-limits
+    datacenter IP ranges far more aggressively than home connections. A run
+    that fails on the first attempt very often succeeds a few seconds later.
+
+    BUMPED FROM 3 TO 5 ATTEMPTS, WITH LONGER BACKOFF AND JITTER. Three quick
+    attempts (3s, 6s) is enough for a one-off hiccup but not for a real rate
+    limit window, which can hold for 15-20+ seconds -- three fast attempts
+    can all land inside the same blocked window and give up right before it
+    would have cleared. Every time this falls through to a fallback engine,
+    the video's captions switch from edge-tts's exact per-word timing to an
+    ESTIMATED one (see estimate_word_timings below), which is the most
+    likely real cause of visible caption drift -- not a bug in the timing
+    math itself, but silently losing access to ground truth. Fewer
+    fallbacks means fewer videos with estimated timing, which is the actual
+    fix for "the next batch might have the same problem."
+
+    Jitter (a small random extra wait) is added so that when several videos
+    in the same batch hit the limiter at once, their retries do not all
+    land on the exact same second and re-collide.
+    """
+    import time
+    import random
+
+    for attempt in range(1, attempts + 1):
+        try:
+            words = asyncio.run(_edge_tts_with_timings(text, voice_id, output_path))
+            if not words or os.path.getsize(output_path) < 1024:
+                raise RuntimeError("edge-tts returned no audio or no word boundaries")
+            print(f"[voice_engine] ✓ edge-tts: {len(words)} words with exact timings"
+                  + (f" (attempt {attempt})" if attempt > 1 else ""))
+            return words
+        except Exception as e:
+            if attempt < attempts:
+                wait = min(4 * (2 ** (attempt - 1)), 45) + random.uniform(0, 2)
+                print(f"[voice_engine] ⚠ edge-tts attempt {attempt}/{attempts} failed ({e}). "
+                      f"Retrying in {wait:.1f}s...")
+                time.sleep(wait)
+            else:
+                print(f"[voice_engine] ⚠ edge-tts unavailable after {attempts} attempts ({e}). "
+                      f"Falling back to an engine with ESTIMATED (not exact) caption timing.")
+    return None
+
+
+# ─── Engine 0 (primary): Kokoro, fully offline, always male ────────────────
+
+
+def _try_kokoro(text, voice_profile, output_path):
+    """See engine/kokoro_tts.py for why this is the PRIMARY engine in this
+    build rather than a fallback. Returns word list (estimated timings) on
+    success, None on any failure — same contract as every other _try_*
+    engine in this chain."""
+    try:
+        from engine import kokoro_tts
+        if not kokoro_tts.available():
+            return None
+        result = kokoro_tts.synthesize(text, voice_profile, output_path)
+        if not result:
+            return None
+        return estimate_word_timings(text, result["duration_seconds"])
+    except Exception as e:
+        print(f"[voice_engine] ⚠ Kokoro failed ({e}).")
+        return None
+
+
+# ─── Engine 2: Piper, fully offline ──────────────────────────────────────────
+
+
+def _try_piper(text, output_path):
+    """Piper produces a wav; timings are estimated from word length.
+
+    Piper has no word-boundary output, so timings here are proportional to
+    syllable-weighted word length across the measured audio duration. That is
+    less accurate than edge-tts, typically within about 80ms per word, which is
+    imperceptible for captions and fine for lip sync. The trade is worth it:
+    this path has no network dependency and cannot be broken by a third party.
+    """
+    piper = shutil.which("piper")
+    if not piper:
+        return None
+    model = get("PIPER_MODEL_PATH")
+    if not model or not os.path.exists(model):
+        print("[voice_engine] ⚠ Piper is installed but PIPER_MODEL_PATH is not set or missing.")
+        return None
+    # A real Piper voice model is tens of MB; a failed download (an HTML
+    # error page saved as if it were the model) is a few hundred bytes at
+    # most. Directly observed this exact failure mode while wiring up the
+    # install step — a bad URL or a transient host hiccup silently saves a
+    # "Not Found" page instead of raising an error, and Piper would then
+    # fail in a much less clear way deeper in the subprocess call. Checked
+    # here too, not just at install time, so a stale or manually-placed bad
+    # file can't cause that either.
+    try:
+        if os.path.getsize(model) < 1_000_000:
+            print(f"[voice_engine] \u26a0 PIPER_MODEL_PATH points to a file only "
+                  f"{os.path.getsize(model)} bytes \u2014 too small to be a real voice "
+                  f"model (probably a failed download). Skipping Piper.")
+            return None
+    except OSError:
+        return None
+    try:
+        wav_path = output_path.replace(".mp3", ".wav")
+        subprocess.run(
+            [piper, "--model", model, "--output_file", wav_path],
+            input=text.encode("utf-8"), capture_output=True, check=True, timeout=300,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame", "-q:a", "2", output_path],
+            capture_output=True, check=True, timeout=180,
+        )
+        os.remove(wav_path)
+        duration = _probe_duration(output_path)
+        print(f"[voice_engine] ✓ Piper (offline), {duration:.1f}s — timings estimated")
+        return estimate_word_timings(text, duration)
+    except Exception as e:
+        print(f"[voice_engine] ⚠ Piper failed ({e}).")
+        return None
+
+
+# ─── Engine 3: gTTS, last resort ─────────────────────────────────────────────
+
+
+def _try_gtts(text, output_path):
+    try:
+        from gtts import gTTS
+        gTTS(text=text, lang="en", slow=False).save(output_path)
+        duration = _probe_duration(output_path)
+        print(f"[voice_engine] ✓ gTTS fallback, {duration:.1f}s — timings estimated")
+        return estimate_word_timings(text, duration)
+    except Exception as e:
+        print(f"[voice_engine] ⚠ gTTS failed ({e}).")
+        return None
+
+
+# ─── Timing estimation (used only by the fallback engines) ───────────────────
+
+_VOWEL_GROUPS = re.compile(r"[aeiouy]+", re.I)
+
+
+def _syllables(word: str) -> int:
+    """Rough syllable count. Speech time tracks syllables far better than it
+    tracks characters, so distributing time by syllable keeps 'a' from being
+    allotted the same duration as 'extraordinarily'."""
+    w = re.sub(r"[^a-z]", "", word.lower())
+    if not w:
+        return 1
+    n = len(_VOWEL_GROUPS.findall(w))
+    if w.endswith("e") and n > 1:
+        n -= 1
+    return max(n, 1)
+
+
+def estimate_word_timings(text: str, total_duration: float) -> list:
+    words = text.split()
+    if not words or total_duration <= 0:
+        return []
+    weights = [_syllables(w) + (0.6 if re.search(r"[.,!?;:]$", w) else 0) for w in words]
+    total_w = sum(weights) or 1
+    out, t = [], 0.0
+    for w, weight in zip(words, weights):
+        span = total_duration * (weight / total_w)
+        out.append({
+            "word": w.strip(".,!?;:\"'"),
+            "start": round(t, 3),
+            "end": round(t + span * 0.92, 3),  # small gap so words do not butt together
+        })
+        t += span
+    return out
+
+
+def _probe_duration(path: str) -> float:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        return float(out.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+# ─── Public API ──────────────────────────────────────────────────────────────
+
+
+def generate_voiceover(
+    full_script: str,
+    voice_profile: str = "default",
+    output_dir: str = None,
+    job_id: str = "job",
+    voice_id: str = None,
+) -> dict:
+    """Generates voice audio plus word-level timings.
+
+    Returns {"audio_path", "duration_seconds", "word_timestamps", "engine"}.
+    The contract is unchanged from the previous version, so every downstream
+    module keeps working without modification.
+    """
+    output_dir = output_dir or get("OUTPUT_DIR", "output")
+    _require_ffmpeg()
+    os.makedirs(output_dir, exist_ok=True)
+    audio_path = os.path.join(output_dir, f"{job_id}_voice.mp3")
+
+    voice_id = voice_id or VOICE_PROFILES.get(voice_profile, VOICE_PROFILES["default"])
+    print(f"[voice_engine] Generating TTS: profile='{voice_profile}', job='{job_id}'")
+
+    # Engine order is profile-aware (see INDIAN_ACCENT_PROFILES above): only
+    # edge-tts can actually deliver an Indian-English accent, so profiles
+    # that asked for one try it FIRST. Every other profile keeps the
+    # original Kokoro-first order unchanged, for the reliability reasons in
+    # this module's docstring.
+    wants_indian_accent = voice_profile in INDIAN_ACCENT_PROFILES
+    words = engine = None
+    if wants_indian_accent:
+        words, engine = _try_edge_tts(full_script, voice_id, audio_path), "edge-tts"
+        if words is None:
+            words, engine = _try_kokoro(full_script, voice_profile, audio_path), "kokoro"
+            if words is not None:
+                print(f"[voice_engine] ℹ '{voice_profile}' asked for an Indian-English "
+                      f"accent, but edge-tts was unreachable this run — this video's "
+                      f"narration used Kokoro's closest offline voice instead (not "
+                      f"Indian-accented). This is occasional, not systemic; most runs "
+                      f"reach edge-tts fine.")
+    else:
+        words, engine = _try_kokoro(full_script, voice_profile, audio_path), "kokoro"
+        if words is None:
+            words, engine = _try_edge_tts(full_script, voice_id, audio_path), "edge-tts"
+    if words is None:
+        words, engine = _try_piper(full_script, audio_path), "piper"
+    if words is None:
+        words, engine = _try_gtts(full_script, audio_path), "gtts"
+        if words is not None:
+            # gTTS has no male-voice control at all — reaching this point
+            # means every reliable engine failed AND edge-tts's network call
+            # also failed, so the standing "male voice everywhere" rule is
+            # about to be broken for this one video. Loud, not silent.
+            try:
+                from engine import alerts
+                alerts.alert(
+                    "A video used the female-only gTTS fallback",
+                    f"Job '{job_id}': Kokoro, edge-tts AND Piper all failed, so this video's "
+                    f"narration used gTTS — the only engine in this chain with no male-voice "
+                    f"option. Check that Kokoro's model files downloaded correctly (see "
+                    f"docs/03) and that this runner can reach the network.",
+                    severity="warn",
+                )
+            except Exception:
+                pass
+    if words is None:
+        raise RuntimeError(
+            "Every TTS engine failed. Kokoro needs its model files (auto-downloaded on "
+            "first use, see docs/03); edge-tts and gTTS need network access; Piper needs "
+            "PIPER_MODEL_PATH set to a downloaded voice model."
+        )
+
+    duration = _probe_duration(audio_path) or (words[-1]["end"] if words else 0.0)
+
+    ts_path = os.path.join(output_dir, f"{job_id}_timestamps.json")
+    with open(ts_path, "w", encoding="utf-8") as f:
+        json.dump(words, f, indent=2, ensure_ascii=False)
+
+    print(f"[voice_engine] ✓ {len(words)} words, {duration:.1f}s total (engine={engine})")
+    return {
+        "audio_path": audio_path,
+        "duration_seconds": round(duration, 2),
+        "word_timestamps": words,
+        "engine": engine,
+    }
+
+
+def generate_multi_voice(scenes: list, output_dir: str, job_id: str, default_voice: str = "default") -> dict:
+    """Renders one audio track per speaker turn and concatenates them.
+
+    Used by character_skit so two characters can hold a conversation in
+    different voices. Each scene is synthesised separately, then the pieces are
+    joined and every scene's word timings are shifted by the running offset so
+    the global timeline stays correct.
+
+    THE BUG THIS FIXES: every character's voice used to come ONLY from
+    CHARACTER_VOICES (a fixed name -> voice mapping), and that mapping always
+    won over `default_voice` whenever a scene had a real character name — which
+    is every scene, since script_generator always fills one in. `default_voice`
+    here is whatever orchestrator.py resolved for this specific video (a
+    channel's own voice_override, else the persona's preferred_voice, else
+    the Settings fallback — see that resolution for the full chain), so
+    choosing a voice anywhere in that chain did nothing for a character skit:
+    whichever named character had the most lines (very often "cat",
+    CHARACTER_VOICES' only female entry) simply kept speaking in ITS assigned
+    voice regardless of what was actually chosen. That is precisely "I set
+    the voice to male and a female voice stayed attached the whole time."
+
+    Now: the PRIMARY character (whoever has the most scenes — the actual
+    voice a viewer mostly hears) uses that resolved choice. Anyone else in
+    the scene keeps their fixed CHARACTER_VOICES voice, so a genuine
+    two-character exchange still sounds like two different people — only
+    the dominant, most-heard voice is the one that's actually controllable,
+    which is the one that was silently unreachable before.
+    """
+    _require_ffmpeg()
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Who's actually the primary speaker in THIS video — the one whose
+    # voice a viewer will mostly associate with it.
+    from collections import Counter
+    speaker_counts = Counter(s.get("character") for s in scenes if (s.get("voice_text") or "").strip())
+    primary_character = speaker_counts.most_common(1)[0][0] if speaker_counts else None
+    primary_voice_override = VOICE_PROFILES.get(default_voice)
+
+    parts, all_words, offset = [], [], 0.0
+    for i, scene in enumerate(scenes):
+        text = (scene.get("voice_text") or "").strip()
+        if not text:
+            continue
+        character = scene.get("character")
+        if primary_voice_override and character == primary_character:
+            voice_id = primary_voice_override
+        else:
+            voice_id = CHARACTER_VOICES.get(character) or VOICE_PROFILES.get(
+                default_voice, VOICE_PROFILES["default"]
+            )
+        part_path = os.path.join(output_dir, f"{job_id}_part{i}.mp3")
+
+        result = generate_voiceover(
+            text, output_dir=output_dir, job_id=f"{job_id}_part{i}", voice_id=voice_id
+        )
+        shutil.move(result["audio_path"], part_path)
+
+        scene_words = [
+            {"word": w["word"], "start": round(w["start"] + offset, 3), "end": round(w["end"] + offset, 3)}
+            for w in result["word_timestamps"]
+        ]
+        scene["_words"] = scene_words
+        scene["_voice_start"] = offset
+        all_words.extend(scene_words)
+
+        parts.append(part_path)
+        # A beat of silence between speakers. Without it the second character
+        # starts talking over the first and the exchange reads as one voice.
+        offset += result["duration_seconds"] + 0.28
+
+    if not parts:
+        raise ValueError("No scenes had any voice_text to speak.")
+
+    combined = os.path.join(output_dir, f"{job_id}_voice.mp3")
+    _concat_with_gaps(parts, combined, gap_seconds=0.28)
+
+    duration = _probe_duration(combined) or offset
+    for p in parts:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    print(f"[voice_engine] ✓ Multi-voice track: {len(parts)} turns, {duration:.1f}s")
+    return {
+        "audio_path": combined,
+        "duration_seconds": round(duration, 2),
+        "word_timestamps": all_words,
+        "engine": "edge-tts-multi",
+    }
+
+
+def _concat_with_gaps(parts: list, output_path: str, gap_seconds: float = 0.28):
+    """Concatenates mp3 parts with silence between them.
+
+    Uses the concat FILTER rather than the concat demuxer because the demuxer
+    requires identical encoding parameters across inputs, and separate edge-tts
+    calls do not guarantee that. The filter re-encodes, which is slower but
+    cannot produce the subtly-corrupt output the demuxer does on mismatch.
+    """
+    silence = os.path.join(os.path.dirname(output_path) or ".", "_gap.mp3")
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+         "-t", str(gap_seconds), "-q:a", "9", silence],
+        capture_output=True, check=True, timeout=60,
+    )
+
+    inputs, filters = [], []
+    idx = 0
+    for i, part in enumerate(parts):
+        inputs += ["-i", part]
+        filters.append(f"[{idx}:a]")
+        idx += 1
+        if i < len(parts) - 1:
+            inputs += ["-i", silence]
+            filters.append(f"[{idx}:a]")
+            idx += 1
+
+    filter_complex = "".join(filters) + f"concat=n={idx}:v=0:a=1[out]"
+    subprocess.run(
+        ["ffmpeg", "-y", *inputs, "-filter_complex", filter_complex,
+         "-map", "[out]", "-codec:a", "libmp3lame", "-q:a", "2", output_path],
+        capture_output=True, check=True, timeout=300,
+    )
+    try:
+        os.remove(silence)
+    except OSError:
+        pass
+
+
+def get_scene_timestamps(word_timestamps: list, scenes: list) -> list:
+    """Assigns each scene a start and end time on the global timeline.
+
+    Much simpler than the version this replaces. That one had to align the
+    script we sent against a transcript of the audio, because Whisper's word
+    list did not match the script's word list. Now the word list IS the
+    script's word list, so scene boundaries are a straight cumulative count.
+
+    The contiguity pass at the end is kept and still matters: it guarantees
+    every scene's end is exactly the next scene's start, so there is no instant
+    of the timeline that no background clip covers. A gap there is what caused
+    the ~2 second cut to solid black in the earlier build.
+    """
+    if not word_timestamps or not scenes:
+        return scenes
+
+    # Multi-voice already assigned per-scene words during synthesis.
+    if all(s.get("_words") for s in scenes):
+        out = []
+        for s in scenes:
+            words = s["_words"]
+            out.append({**s, "time_start": words[0]["start"], "time_end": words[-1]["end"]})
+        return _force_contiguous(out, word_timestamps)
+
+    total = len(word_timestamps)
+    out, cursor = [], 0
+    for scene in scenes:
+        count = len(str(scene.get("voice_text", "")).split())
+        start_i = min(cursor, total - 1)
+        end_i = min(cursor + max(count - 1, 0), total - 1)
+        out.append({
+            **scene,
+            "time_start": word_timestamps[start_i]["start"],
+            "time_end": word_timestamps[end_i]["end"],
+            "_words": word_timestamps[start_i:end_i + 1],
+        })
+        cursor += count
+
+    return _force_contiguous(out, word_timestamps)
+
+
+def _force_contiguous(scenes: list, word_timestamps: list) -> list:
+    for i in range(len(scenes) - 1):
+        scenes[i]["time_end"] = scenes[i + 1]["time_start"]
+    if scenes:
+        scenes[0]["time_start"] = 0.0
+        scenes[-1]["time_end"] = max(scenes[-1]["time_end"], word_timestamps[-1]["end"])
+    return scenes
+
+
+if __name__ == "__main__":
+    demo = (
+        "Inside this cleanroom, transistors smaller than a strand of DNA are being built. "
+        "One chip holds more than 50 billion of them, made by a 200 million dollar machine."
+    )
+    result = generate_voiceover(demo, voice_profile="documentary_male", job_id="test001")
+    print(json.dumps(result["word_timestamps"][:12], indent=2))

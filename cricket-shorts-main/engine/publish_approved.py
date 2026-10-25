@@ -1,0 +1,452 @@
+"""
+publish_approved.py
+-------------------
+PUBLISH SCRIPT — Publishes approved videos to YouTube
+
+Called by the separate GitHub Actions "publish" workflow (runs every 30 min).
+Queries Supabase for videos with status='approved', publishes them one at a time
+(to avoid hitting YouTube API quota limits), then updates status to 'published'.
+
+Deliberately throttled: publishes ONE video per run by default. Change via
+the Admin Panel Settings page (publish_per_run) — this used to only read a
+PUBLISH_PER_RUN env var that the settings-table value had no effect on;
+FIXED so the dashboard setting is the real source of truth, with the env
+var still available as an explicit CI override if you want one.
+"""
+
+import os
+import json
+import tempfile
+import requests
+from datetime import datetime, timezone, timedelta
+from supabase import create_client
+
+import os
+import sys
+
+# Allow BOTH `python -m engine.publisher --setup` (correct) and
+# `python engine/publisher.py --setup` (what people naturally type).
+# Running a file directly puts engine/ on sys.path instead of the project root,
+# so `from engine.config import ...` fails with ModuleNotFoundError. Adding the
+# project root here makes the natural command work too, because telling a
+# beginner "you typed it wrong" is a worse answer than making both work.
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from engine.config import require, get
+from engine.publisher import upload_video, set_thumbnail
+from engine import channels as channels_mod
+from engine import concept_memory
+from engine import storage_r2
+from engine import alerts
+
+
+def _load_publish_per_run(db) -> int:
+    env_override = os.environ.get("PUBLISH_PER_RUN")
+    if env_override:
+        try:
+            return int(env_override)
+        except ValueError:
+            pass
+    try:
+        row = db.table("settings").select("value").eq("key", "publish_per_run").single().execute()
+        return int(row.data["value"])
+    except Exception:
+        return 1
+
+
+def run_publish_pipeline():
+    """Fetches the oldest approved video(s) and publishes them to YouTube."""
+    cfg = require(["SUPABASE_URL", "SUPABASE_SERVICE_KEY"])
+    db  = create_client(cfg["SUPABASE_URL"], cfg["SUPABASE_SERVICE_KEY"])
+
+    publish_per_run = _load_publish_per_run(db)
+
+    # Multi-channel routing. Each channel carries its own credentials and its
+    # own daily cap, because YouTube's 10,000-unit budget is per Google Cloud
+    # project — see engine/channels.py.
+    all_channels = channels_mod.load_channels(db=db)
+    if all_channels:
+        print(f"[publish] {len(all_channels)} channel(s) configured:")
+        for ch in all_channels:
+            print(f"[publish]   - {channels_mod.describe(ch)}")
+
+    # ── "Publish Now" queue jumpers first ────────────────────────────────
+    # A video with publish_now=true was chosen by a human, in the dashboard,
+    # seconds ago. It bypasses the spacing rules entirely: those exist to
+    # stop the ROBOT from bursting, and a deliberate button press is not a
+    # burst. Without this there was no way to say "post this one, now" short
+    # of editing the database.
+    revived = _revive_retryable_failures(db)
+    if revived:
+        print(f"[publish] Returned {revived} previously-failed video(s) to the "
+              f"queue for another attempt.")
+
+    forced = (
+        db.table("videos").select("*")
+        .eq("status", "approved").eq("publish_now", True)
+        .order("created_at", desc=False).execute().data
+    ) or []
+
+    # ───────────────────────────────────────────────────────────────────────
+    # BUGFIX — AUTO-APPROVED VIDEOS WERE STARVED OUT OF THE QUEUE FOREVER
+    #
+    # This used to be `.order("approved_at", desc=False).limit(publish_per_run)`.
+    # Videos auto-approved by the engine had approved_at = NULL (only the
+    # dashboard ever set it — see orchestrator._save_and_finalize's note), and
+    # PostgreSQL sorts NULLs LAST on an ascending order. With publish_per_run
+    # = 1, the single row fetched each run was always the oldest HAND-approved
+    # video, so auto-approved videos never got published at all while even one
+    # hand-approved video remained. That is a silent, permanent drop between
+    # generation and publishing.
+    #
+    # The fix does not rely on the database's NULL ordering at all: order by
+    # created_at (which is never NULL), pull a slightly wider window, then sort
+    # in Python on approved_at-or-created_at and take the oldest. This also
+    # repairs rows ALREADY in the queue with a NULL approved_at, which a
+    # forward-only fix would have left stuck.
+    # ───────────────────────────────────────────────────────────────────────
+    candidates = (
+        db.table("videos")
+        .select("*")
+        .eq("status", "approved")
+        .neq("publish_now", True)
+        .order("created_at", desc=False)
+        .limit(max(publish_per_run * 10, 25))
+        .execute()
+        .data
+    ) or []
+
+    def _queue_position(v):
+        return v.get("approved_at") or v.get("created_at") or ""
+
+    normal = sorted(candidates, key=_queue_position)[:publish_per_run]
+
+    # Backfill the missing timestamps we just worked around, so the queue
+    # heals itself instead of needing this workaround forever.
+    for v in normal:
+        if not v.get("approved_at"):
+            stamp = v.get("created_at") or datetime.now(timezone.utc).isoformat()
+            try:
+                db.table("videos").update({"approved_at": stamp}).eq("id", v["id"]).execute()
+                v["approved_at"] = stamp
+            except Exception:
+                pass
+
+    rows = forced + normal
+
+    if not rows:
+        print("[publish] No approved videos to publish. Exiting.")
+        return
+
+    if forced:
+        print(f"[publish] {len(forced)} video(s) marked PUBLISH NOW \u2014 skipping spacing rules for those.")
+    print(f"[publish] Found {len(rows)} approved video(s). Publishing...")
+    published_count = 0
+
+    for row in rows:
+        job_id = row["job_id"]
+        is_forced = bool(row.get("publish_now"))
+        print(f"\n[publish] Publishing: '{row['title']}' (job_id: {job_id})"
+              + ("  [FORCED - Publish Now]" if is_forced else ""))
+        tmp_path = None
+        tmp_thumb_path = None
+
+        try:
+            # ── Pick the destination channel ─────────────────────────────
+            channel = None
+            creds = None
+            if all_channels:
+                channel = channels_mod.route(row.get("category") or row.get("archetype") or "",
+                                             channels=all_channels, persona_key=row.get("persona_key"))
+                if not channel:
+                    print(f"[publish] \u26a0 No channel accepts category "
+                          f"'{row.get('category')}'. Leaving for manual export.")
+                    _update_status(db, row["id"], "needs_manual",
+                                   error="No channel configured for this category")
+                    continue
+
+                if channel.get("publish_mode") != "auto":
+                    print(f"[publish] Channel '{channel.get('name')}' is set to manual. "
+                          f"Marking for export instead of publishing.")
+                    _update_status(db, row["id"], "needs_manual",
+                                   error="Channel is set to manual posting")
+                    continue
+
+                # ── SPACING ──────────────────────────────────────────────
+                # Enforce a minimum gap between uploads so a 4/day cap means
+                # one every 6 hours, not four in the first two hours followed
+                # by twenty-two hours of silence. See channels.min_gap_minutes.
+                if not is_forced:
+                    ok, why = channels_mod.ready_to_publish(channel, db=db)
+                    if not ok:
+                        print(f"[publish] \u23f3 Holding '{row['title']}' \u2014 {why}")
+                        print(f"[publish]    (Use the 'Publish Now' button in the dashboard "
+                              f"to post it immediately anyway.)")
+                        continue
+
+                cap = channels_mod.daily_cap_for(channel)
+                sent = channels_mod.published_today(channel.get("id"), db=db)
+                # The daily cap is a YouTube-quota guardrail, so even a forced
+                # publish respects it — pushing past it returns a 403 that
+                # burns quota and helps nobody.
+                if sent >= cap:
+                    # Stop BEFORE the API call. Pushing past the cap returns a
+                    # 403 that also burns quota, so the next run starts even
+                    # further behind.
+                    print(f"[publish] Channel '{channel.get('name')}' hit its daily cap "
+                          f"({sent}/{cap}). Skipping.")
+                    alerts.daily_quota_reached(sent, cap)
+                    continue
+
+                creds = channels_mod.credentials_for(channel)
+                if not creds:
+                    missing = channels_mod.missing_credentials_for(channel)
+                    detail = f"Missing: {', '.join(missing)}" if missing else "credentials incomplete"
+                    alerts.youtube_auth_broken(
+                        channel.get("name", "?"),
+                        f"The channel's YOUTUBE_* secrets are missing or incomplete. {detail}.",
+                    )
+                    _update_status(db, row["id"], "publish_failed",
+                                   error=f"Channel credentials missing \u2014 {detail}")
+                    continue
+
+            video_url = row.get("storage_url")
+            if not video_url:
+                print(f"[publish] \u26a0 No storage URL for job {job_id}. Skipping.")
+                _update_status(db, row["id"], "failed", error="No storage URL")
+                continue
+
+            print(f"[publish] Downloading video from storage...")
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp_path = tmp.name
+                resp = requests.get(video_url, stream=True, timeout=120)
+                resp.raise_for_status()
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    tmp.write(chunk)
+
+            hashtags = row.get("hashtags") or []
+            if isinstance(hashtags, str):
+                hashtags = json.loads(hashtags)
+
+            result = upload_video(
+                video_path=tmp_path,
+                title=row["title"],
+                description=row.get("description", ""),
+                hashtags=hashtags,
+                # FIXED: this was hardcoded "tech" for every single upload —
+                # on a cricket/sports channel that mis-categorized every
+                # video published so far on YouTube's own side (see
+                # publisher.py's CATEGORY_MAP for the full story).
+                category="sports",
+                privacy="public",
+                notify_subscribers=False,
+                creds_override=creds,
+                captions_srt=row.get("captions_srt"),
+            )
+
+            db.table("videos").update({
+                "status":       "published",
+                "youtube_id":   result["video_id"],
+                "youtube_url":  result["url"],
+                "channel_id":   (channel or {}).get("id"),
+                "published_at": datetime.now(timezone.utc).isoformat(),
+                # FIXED (Part 5) — "compare performance across publish time
+                # slot" was impossible because the slot was never recorded.
+                # Stored in IST, not UTC, because the audience is Indian and
+                # 17:00 UTC vs 20:00 UTC means nothing to a human reading
+                # the dashboard, while "10:30 PM" means everything.
+                "publish_slot_hour": _ist_hour_label(),
+                "publish_now":  False,   # clear the flag so it can't re-fire
+                # Same reasoning as _update_status above: no DB trigger
+                # keeps this current on UPDATE, only an insert-time default.
+                "updated_at":   datetime.now(timezone.utc).isoformat(),
+            }).eq("id", row["id"]).execute()
+
+            # Custom thumbnail, if orchestrator.py's thumbnail_generator.py
+            # built one for this video. Best-effort and strictly AFTER the
+            # video itself is confirmed live — see set_thumbnail()'s own
+            # docstring for the one real prerequisite (a phone-verified
+            # YouTube account) and what happens when that isn't done yet.
+            thumbnail_url = row.get("thumbnail_url")
+            if thumbnail_url:
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+                        tmp_thumb_path = tf.name
+                        thumb_resp = requests.get(thumbnail_url, stream=True, timeout=30)
+                        thumb_resp.raise_for_status()
+                        for chunk in thumb_resp.iter_content(chunk_size=1024 * 1024):
+                            tf.write(chunk)
+                    set_thumbnail(result["video_id"], tmp_thumb_path, creds_override=creds)
+                except Exception as e:
+                    print(f"[publish] ⚠ Could not set custom thumbnail for {job_id} ({e}). "
+                          f"The video itself published fine with YouTube's default thumbnail.")
+
+            # Commit the concept to the permanent ledger only now, on the way
+            # out. Recording it at generation time would burn the idea even
+            # when the video was rejected, slowly starving the topic pool.
+            try:
+                storyboard = row.get("storyboard")
+                if isinstance(storyboard, str):
+                    storyboard = json.loads(storyboard)
+                if storyboard:
+                    concept_memory.record_concept(storyboard, job_id, db=db)
+            except Exception as e:
+                print(f"[publish] \u26a0 Could not record concept: {e}")
+
+            # The file has done its job. Deleting immediately is what keeps a
+            # free storage tier permanently sufficient.
+            storage_r2.delete_video(job_id, db=db)
+
+            published_count += 1
+            print(f"[publish] \u2713 Published: {result['url']}")
+
+        except Exception as e:
+            error_msg = _explain_error(e)
+            print(f"[publish] \u2717 Failed to publish job {job_id}: {error_msg}")
+            _update_status(db, row["id"], "publish_failed", error=error_msg)
+            # An auth failure stops EVERY future upload, not just this one, so
+            # it is the one error worth interrupting someone about.
+            if "invalid_grant" in str(e).lower() or "refresh token" in error_msg.lower():
+                alerts.youtube_auth_broken((channel or {}).get("name", "default"), error_msg)
+
+        else:
+            # Only one upload per run once spacing is on. Publishing two
+            # back to back would defeat the gap we just enforced.
+            if not is_forced and published_count >= publish_per_run:
+                break
+
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            if tmp_thumb_path and os.path.exists(tmp_thumb_path):
+                os.unlink(tmp_thumb_path)
+
+
+def _explain_error(e: Exception) -> str:
+    """Turns the most common opaque OAuth failure into an actionable message
+    instead of a raw SDK error, since this specific failure mode is a real,
+    documented Google policy (not a bug) that this project has no code-level
+    fix for: unless your Google Cloud OAuth consent screen has been moved to
+    'In production' (requires Google's verification for the sensitive
+    youtube.upload scope), refresh tokens for apps left in 'Testing' status
+    expire after 7 days, and every publish attempt after that fails until
+    you redo the local `--setup` step and update YOUTUBE_TOKEN_B64."""
+    msg = str(e)
+    lower = msg.lower()
+    if "invalid_grant" in lower or "token has been expired or revoked" in lower:
+        return (
+            f"{msg}\n"
+            f"This usually means your Google OAuth refresh token is no longer valid. If your "
+            f"OAuth consent screen is still in 'Testing' status, Google expires refresh tokens "
+            f"after 7 days — see docs/04_AUTONOMOUS_YOUTUBE_PUBLISHING.md. Fix: re-run "
+            f"`python engine/publisher.py --setup` locally and update the YOUTUBE_TOKEN_B64 "
+            f"GitHub secret, or move the consent screen to 'In production' for a token that "
+            f"doesn't expire on a schedule."
+        )
+    return msg
+
+
+# How many times a failed upload is retried before it is left alone. Three is
+# enough to ride out a token refresh, a quota reset and a transient 5xx
+# without ever becoming an infinite loop that burns quota on a video that is
+# genuinely broken.
+MAX_PUBLISH_ATTEMPTS = 3
+
+# Failure text that a later attempt could plausibly succeed on. A missing
+# storage file or a rejected video will never fix itself, so those are not
+# retried — retrying them would just burn the daily quota that a good video
+# needs.
+_RETRYABLE_FAILURE_MARKERS = (
+    "quota", "429", "rate limit", "resource_exhausted",
+    "500", "502", "503", "504", "internal error", "backend error",
+    "timeout", "timed out", "connection", "ssl", "temporarily",
+    "invalid_grant",        # fixed by re-auth; worth re-trying after that
+    "credentials missing",  # fixed by setting the secret
+    "daily cap",
+)
+
+
+def _ist_hour_label() -> str:
+    """The current hour in India, as 'HH:00'. Used as the publish-slot label
+    that engine/insights.py compares performance across."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%H:00")
+    except Exception:
+        # tzdata missing (Windows without the tzdata package) — fall back to
+        # a fixed +5:30 offset, which is correct year-round for IST since
+        # India observes no daylight saving.
+        return (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%H:00")
+
+
+def _revive_retryable_failures(db) -> int:
+    """Returns videos that failed to PUBLISH (not to generate) to the
+    approved queue, so a transient failure stops being permanent.
+
+    ─────────────────────────────────────────────────────────────────────────
+    THE BUG THIS FIXES (Part 4.2 — "generated count doesn't match published")
+
+    'publish_failed' and 'needs_manual' were terminal statuses. Nothing
+    anywhere — no workflow, no script, no dashboard action — ever moved a row
+    out of them. So a video whose upload hit a momentary 503, or landed while
+    the refresh token happened to be expired, was finished: fully written,
+    fully rendered, sitting in storage, and never published. Every one of
+    those is a video that was generated and not published, with no trace in
+    any count.
+
+    This retries ONLY failures whose text suggests a later attempt could
+    work, at most MAX_PUBLISH_ATTEMPTS times, and leaves genuinely broken
+    videos alone.
+    ─────────────────────────────────────────────────────────────────────────
+    """
+    try:
+        rows = (
+            db.table("videos")
+            .select("id, title, error_log, publish_attempts, storage_url")
+            .in_("status", ["publish_failed", "needs_manual"])
+            .limit(50).execute().data
+        ) or []
+    except Exception as e:
+        print(f"[publish] ⚠ Could not check for retryable failures: {e}")
+        return 0
+
+    revived = 0
+    for r in rows:
+        attempts = int(r.get("publish_attempts") or 0)
+        if attempts >= MAX_PUBLISH_ATTEMPTS:
+            continue
+        if not r.get("storage_url"):
+            continue  # the rendered file is gone; nothing to upload
+        err = (r.get("error_log") or "").lower()
+        if err and not any(m in err for m in _RETRYABLE_FAILURE_MARKERS):
+            continue  # a permanent problem — leave it for a human
+        try:
+            db.table("videos").update({
+                "status": "approved",
+                "publish_attempts": attempts + 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", r["id"]).execute()
+            print(f"[publish] ↻ Retrying '{r.get('title')}' "
+                  f"(attempt {attempts + 2} of {MAX_PUBLISH_ATTEMPTS + 1}).")
+            revived += 1
+        except Exception as e:
+            print(f"[publish] ⚠ Could not requeue video {r.get('id')}: {e}")
+    return revived
+
+
+def _update_status(db, row_id: int, status: str, error: str = None):
+    # updated_at has only an INSERT-time default in the schema (DEFAULT
+    # NOW()), not an update trigger — an UPDATE like this one would silently
+    # leave it at whenever the row was first created, not when it actually
+    # failed to publish. That is the timestamp the dashboard's unread
+    # "new since I last looked" badge on the Failed tab depends on being
+    # accurate, so it is set explicitly here rather than assumed.
+    update = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
+    if error:
+        update["error_log"] = error[:1000]
+    db.table("videos").update(update).eq("id", row_id).execute()
+
+
+if __name__ == "__main__":
+    run_publish_pipeline()

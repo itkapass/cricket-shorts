@@ -180,13 +180,27 @@ def _credentials_from_env(creds_override: dict = None):
     if not (client_id and client_secret and refresh_token):
         return None
 
+    # BUGFIX — do NOT pass scopes= here. google-auth's refresh_grant()
+    # sends whatever is in `scopes` as the `scope` field of the
+    # refresh_token grant request. SCOPES now includes
+    # yt-analytics.readonly, which was added after some channels' tokens
+    # were first issued. Google's token endpoint checks a refresh request's
+    # requested scope against what that SPECIFIC refresh token was actually
+    # granted at consent time — asking for a scope the token doesn't have
+    # fails the WHOLE refresh (not just the analytics part) with
+    # invalid_scope, which is exactly the "PUBLISH FAILED / invalid_scope"
+    # cards this project has been seeing. Omitting scopes here means Google
+    # just returns an access token for whatever the refresh token actually
+    # has — which is all a refresh needs to do. (This is unrelated to the
+    # one-time consent flow in _run_interactive_setup(), which still passes
+    # scopes=SCOPES correctly, since that's what actually negotiates new
+    # scopes onto a token.)
     creds = google.oauth2.credentials.Credentials(
         token=None,  # no cached access token — force an immediate refresh below
         refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=client_id,
         client_secret=client_secret,
-        scopes=SCOPES,
     )
     try:
         creds.refresh(Request())
@@ -202,6 +216,14 @@ def _credentials_from_env(creds_override: dict = None):
                 "in docs/07_YOUTUBE_AND_CHANNELS.md section 3.\n\n"
                 "TEMPORARY FIX: re-run `python engine/publisher.py --setup` and update the "
                 "secret — but you will be back here in 7 days."
+            ) from e
+        if "invalid_scope" in msg:
+            raise RuntimeError(
+                "The YouTube refresh token was rejected (invalid_scope).\n\n"
+                "This means the stored refresh token itself is bad or was revoked — a plain "
+                "refresh (no scope requested) still failed. "
+                "Re-run `python -m engine.publisher --setup` for this channel and update its "
+                "YOUTUBE_REFRESH_TOKEN secret with the new value."
             ) from e
         raise
     return creds

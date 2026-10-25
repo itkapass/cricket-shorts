@@ -35,4 +35,3 @@ Thumbs.db
 # Clip cache (downloaded B-roll clips — can be re-fetched)
 output/clip_cache/
 supabase/.temp/
-cricket-shorts-main/

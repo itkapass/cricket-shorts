@@ -263,6 +263,26 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
             last_error = e
             code = getattr(e, "code", None)
             if code == 404 or "not found" in str(e).lower() or "deprecated" in str(e).lower():
+                # BUGFIX — this used to give up immediately, even though the
+                # 429 branch right below already knows how to pick a
+                # different model and try again. A 404 here means Google
+                # has retired THIS specific name (ListModels can keep
+                # advertising a name for a while after generateContent stops
+                # honoring it), not that Gemini itself is unavailable. If a
+                # pin (GEMINI_MODEL) caused this, don't silently override the
+                # user's explicit choice — that's exactly what "pinning"
+                # means. But an auto-discovered name that turns out to be
+                # dead should be crossed off and retried, same as a 429.
+                if not _model_retried.get("done") and not get("GEMINI_MODEL"):
+                    model_registry.mark_model_exhausted(model_name)
+                    alternative = model_registry.choose_text_model(
+                        _active_api_key.get("key"), force_refresh=True)
+                    if alternative and alternative != model_name:
+                        _model_retried["done"] = True
+                        print(f"[script_generator] \u26a0 '{model_name}' 404'd (likely "
+                              f"retired) — retrying once on '{alternative}'.")
+                        model_name = alternative
+                        continue
                 raise RuntimeError(
                     f"Gemini model call failed, likely because the model name is no longer "
                     f"available: {e}\n"

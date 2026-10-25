@@ -1,0 +1,133 @@
+name: Publish Approved Videos
+
+# ─────────────────────────────────────────────────────────────────
+# WORKFLOW 3 of 6: Publish Approved Videos
+#
+# Uploads ONE approved video to YouTube, if enough time has passed since
+# the last one. Videos only become "approved" when you press Approve in
+# the dashboard, so this can never publish something you have not seen.
+# ─────────────────────────────────────────────────────────────────
+
+on:
+  # Runs hourly, but does NOT publish hourly.
+  #
+  # The spacing is decided in code (engine/channels.py -> min_gap_minutes),
+  # derived from each channel's daily cap: a cap of 4/day becomes one upload
+  # every 6 hours. This job wakes up every hour, asks "has the gap passed?",
+  # and almost always answers no and exits in about 10 seconds.
+  #
+  # WHY IT USED TO BE WRONG: this ran every 30 minutes and published every
+  # approved video it found, with no gap check at all. So a channel capped
+  # at 4/day did not post 4 videos across the day — it posted all 4 inside
+  # the first two hours and then went silent for twenty-two. Four Shorts
+  # released minutes apart compete with each other for the same slice of
+  # impressions instead of each getting its own window, and a daily
+  # burst-then-silence pattern is a much more machine-looking signature
+  # than a steady cadence.
+  #
+  # Waking hourly rather than half-hourly halves the number of runs (24/day
+  # instead of 48) while costing you at most an hour of drift on a 6-hour
+  # gap — and the "Publish Now" button does not wait for the cron at all,
+  # it triggers this workflow immediately.
+  schedule:
+    - cron: '7 * * * *'   # Hourly, at 7 past — off the hour so it is not
+                          # queued alongside every other cron on GitHub.
+
+  # Manual: Actions tab -> Publish Approved Videos -> Run workflow.
+  # Or press "Publish Now" on a video in the dashboard, which marks that
+  # specific video as a queue-jumper and triggers this immediately.
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish to YouTube
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout code ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ──────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Install Python dependencies ────────────────────────────
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      # ── 4. Run publish pipeline ────────────────────────────────────
+      # AUTH, FIXED: previously this step (and the two below it) existed to
+      # base64-decode a pickled OAuth token back to a local file before
+      # running, because publisher.py only knew how to read a local pickle
+      # file. publisher.py now reads YOUTUBE_CLIENT_ID/SECRET/REFRESH_TOKEN
+      # directly as plain env vars — same three values, no pickle/base64
+      # round-trip, and it's the same code path Docker and local runs use
+      # too. Get these three by running `python engine/publisher.py --setup`
+      # locally once — it prints them for you to paste in as secrets. See
+      # docs/04_AUTONOMOUS_YOUTUBE_PUBLISHING.md.
+      - name: Publish approved videos to YouTube
+        env:
+          SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:   ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_ANON_KEY:      ${{ secrets.SUPABASE_ANON_KEY }}
+          YOUTUBE_CLIENT_ID:      ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET:  ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN:  ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          # BUGFIX: this step never had these at all. publish_approved.py
+          # calls alerts.youtube_auth_broken() and alerts.daily_quota_reached()
+          # directly — the two alerts that matter most for publishing
+          # specifically — and neither could ever actually send, on any
+          # deployment, because this env block simply never gave the Python
+          # process access to the credentials. Found in the same audit that
+          # caught config.py silently hiding these same secrets everywhere else.
+          TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST:              ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:              ${{ secrets.SMTP_PORT }}
+          SMTP_USER:              ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:          ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO:         ${{ secrets.ALERT_EMAIL_TO }}
+          VAPID_PRIVATE_KEY:      ${{ secrets.VAPID_PRIVATE_KEY }}
+          VAPID_CLAIM_EMAIL:      ${{ secrets.VAPID_CLAIM_EMAIL }}
+        run: |
+          python -m engine.publish_approved
+
+      # Package anything marked "post it myself" and attach it to this run.
+      # Without the artifact upload the zip is built inside the runner and
+      # then thrown away when the job ends, so there would be no way to get
+      # the file. Download it from the Summary page of this workflow run.
+      - name: Package videos for manual posting
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+        run: python -m engine.manual_export --all-pending || true
+
+      - name: Upload manual-posting packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-posting-packages
+          path: output/manual_exports/**/*.zip
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Fires even if Python crashed on its very first line. The in-Python
+      # alerting in engine/alerts.py cannot report a crash that happens before
+      # engine/alerts.py is ever reached — this can.
+      - name: Alert on failure
+        if: failure()
+        uses: ./.github/actions/notify-failure
+        with:
+          workflow_name: "Publish Approved Videos"
+          telegram_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          telegram_chat: ${{ secrets.TELEGRAM_CHAT_ID }}

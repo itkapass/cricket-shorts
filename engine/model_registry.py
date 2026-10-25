@@ -69,15 +69,20 @@ CACHE_TTL_SECONDS = 24 * 60 * 60
 FREE_TIER_PREFERRED = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
 ]
 
 # Last-resort ladder, used only if discovery itself fails (no network, API
 # down). Free-tier-safe first on purpose — see the note above.
+#
+# BUGFIX: gemini-2.0-flash and gemini-2.0-flash-lite used to be here too.
+# Google has since retired the whole 2.0 line (confirmed: live calls to
+# gemini-2.0-flash now 404 with "model ... is no longer available", even
+# though ListModels can keep advertising a retired name for a while after
+# it stops actually working — see the 404 fallback in script_generator.py,
+# which now treats that the same way a 429 is treated: drop the dead name
+# and retry once with the next one, instead of dying outright).
 FALLBACK_CHAIN = [
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
     "gemini-2.5-flash-lite",
 ]
 

@@ -1,0 +1,96 @@
+name: Analytics Sync
+
+# ─────────────────────────────────────────────────────────────────
+# WORKFLOW: Analytics Sync (performance feedback loop)
+#
+# Two jobs, in order, both read-mostly and safe to run on a schedule with
+# nobody watching (see engine/analytics_sync.py and engine/performance_loop.py
+# for the full reasoning):
+#
+#   1. Pull fresh view/like/comment counts for every published video from
+#      the last 30 days and record them. This is what lets the channel's
+#      REAL performance start overriding sports_catalog.py's editorial
+#      "high"/"standard" guesses — content_mix.py's daily winner/variety
+#      split gets smarter automatically as this accumulates.
+#
+#   2. Look for genuine standouts (views well above this channel's own
+#      recent average — see performance_loop.is_standout()) and, for each
+#      one that hasn't already triggered this, invent a small number of
+#      genuinely different (never identical) follow-up topics — the
+#      explicit ask: "if a post gets many views, comments and shares, the
+#      app can see that and can make similarly same topic and content (not
+#      same, just similar)... the followup everything will not be the same".
+#
+# View counts don't meaningfully change minute to minute, so once a day is
+# plenty — this never needs to run more often than that to be useful.
+# ─────────────────────────────────────────────────────────────────
+
+on:
+  # Once a day, a few hours after the day's last scheduled upload — gives
+  # same-day uploads a little time to accumulate real views before they're
+  # measured, without waiting so long that a standout goes unnoticed for a day.
+  schedule:
+    - cron: '15 2 * * *'   # 02:15 UTC
+
+  # Manual: Actions tab -> Analytics Sync -> Run workflow.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Lets the workflow's automatic GITHUB_TOKEN call GitHub Models — the
+  # third, zero-signup free fallback used by the follow-up-idea generation
+  # call only if Gemini AND Groq have both already failed today. See
+  # engine/github_models_provider.py and engine/llm_router.py.
+  models: read
+
+jobs:
+  analytics-sync:
+    name: Sync video stats and spawn follow-ups
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      # This step only READS YouTube statistics and WRITES new topic rows —
+      # it never uploads, edits, or deletes a video. See
+      # engine/performance_loop.py's module docstring for the exact scope.
+      - name: Sync video performance and spawn follow-up topics
+        env:
+          SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:   ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # The simple, no-OAuth key used to read public view/like/comment
+          # counts — see docs/18. Falls back to the OAuth credentials below
+          # only if this isn't set.
+          YOUTUBE_API_KEY:        ${{ secrets.YOUTUBE_API_KEY }}
+          YOUTUBE_CLIENT_ID:      ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET:  ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN:  ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY:           ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY:     ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_MODEL:           ${{ secrets.GEMINI_MODEL }}
+          TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -m engine.analytics_sync
+
+      # Fires even if Python crashed on its very first line.
+      - name: Alert on failure
+        if: failure()
+        uses: ./.github/actions/notify-failure
+        with:
+          workflow_name: "Analytics Sync"
+          telegram_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          telegram_chat: ${{ secrets.TELEGRAM_CHAT_ID }}

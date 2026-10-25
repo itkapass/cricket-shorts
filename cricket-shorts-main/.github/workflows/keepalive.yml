@@ -1,0 +1,132 @@
+name: Keepalive
+
+# WHY THIS EXISTS
+# GitHub disables scheduled (cron) workflows after 60 days with no commits to
+# the repository. Nothing warns you. Your daily video generation would simply
+# stop running one day and you would find out weeks later.
+#
+# This runs every 10 days and commits the concept ledger, which keeps the repo
+# active on its own. It is a real commit of real data, not a fake empty one:
+# the ledger is genuinely updated by the pipeline and genuinely worth having in
+# version history.
+#
+# The alert is a BACKUP, not the mechanism. A reminder telling you to go push
+# something manually is just another thing that can be missed on a busy week.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# FIXED — this workflow was only doing HALF its job.
+#
+# It was supposed to do two separate things:
+#   (a) keep the GITHUB repo active, so GitHub does not auto-disable the
+#       scheduled workflows after ~60 days. It did do this.
+#   (b) keep the SUPABASE project awake, because free Supabase projects
+#       auto-pause after 7 days with no database activity. It did NOT do this
+#       — there was no database call anywhere in the file.
+#
+# And the cadence was wrong for (b) even in principle: running every 10 days
+# cannot protect against a 7-day pause window. Changed to every 5 days, which
+# comfortably covers both the 7-day Supabase window and the 60-day GitHub one,
+# and a real Supabase query has been added below.
+#
+# In normal operation the other workflows (generate, publish, analytics-sync)
+# touch the database constantly, so Supabase never idles. This matters for the
+# case it was written for: a stretch where generation is paused or failing, and
+# the database quietly pauses on top of it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # Every 5 days at 04:17 UTC. The odd minute is deliberate — GitHub's
+    # scheduler is heavily contended on the hour and jobs get delayed or
+    # dropped at :00.
+    - cron: "17 4 */5 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check how long since the last commit
+        id: age
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          DAYS=$(( (NOW - LAST) / 86400 ))
+          echo "days=$DAYS" >> "$GITHUB_OUTPUT"
+          echo "Last commit was $DAYS day(s) ago (GitHub disables cron at 60)."
+
+      # ── JOB (b): keep the Supabase project awake ─────────────────────────
+      # A free Supabase project auto-pauses after 7 days with no activity, and
+      # a paused project makes every workflow in this repo fail at once. One
+      # tiny read is enough to count as activity.
+      - name: Ping Supabase so the free project does not auto-pause
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
+            echo "::warning::SUPABASE_URL / SUPABASE_SERVICE_KEY are not set, so the"
+            echo "::warning::database could not be pinged. A free Supabase project"
+            echo "::warning::pauses after 7 idle days. Add both secrets (docs/01)."
+            exit 0
+          fi
+          CODE=$(curl -s -o /tmp/ping.txt -w "%{http_code}" \
+            "$SUPABASE_URL/rest/v1/settings?select=key&limit=1" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
+          echo "Supabase responded with HTTP $CODE."
+          if [ "$CODE" = "200" ]; then
+            echo "✓ Database is awake. The 7-day pause clock is reset."
+          else
+            echo "::warning::Supabase did not answer normally (HTTP $CODE). If the"
+            echo "::warning::project has already paused, open your Supabase dashboard"
+            echo "::warning::and press Restore — it is free and takes about a minute."
+            cat /tmp/ping.txt || true
+          fi
+
+      - name: Touch the activity marker
+        run: |
+          mkdir -p .github
+          cat > .github/LAST_ACTIVE.md << 'EOF'
+          # Repository activity marker
+
+          Updated automatically by `.github/workflows/keepalive.yml`.
+
+          GitHub disables scheduled workflows after 60 days of repository
+          inactivity. This file is committed every 5 days so that never
+          happens and your daily video generation keeps running.
+
+          Do not delete this workflow.
+
+          EOF
+          echo "Last automated activity: $(date -u '+%Y-%m-%d %H:%M UTC')" >> .github/LAST_ACTIVE.md
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/LAST_ACTIVE.md concepts.jsonl 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "Nothing changed; making an empty commit to register activity."
+            git commit --allow-empty -m "chore: keepalive [skip ci]"
+          else
+            git commit -m "chore: keepalive + concept ledger [skip ci]"
+          fi
+          git push
+
+      - name: Warn if this nearly did not run in time
+        if: steps.age.outputs.days > 40
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+              -d chat_id="$TELEGRAM_CHAT_ID" \
+              -d text="Keepalive ran, but the repo had been inactive for ${{ steps.age.outputs.days }} days (GitHub disables cron at 60). The keepalive itself may have been skipped previously — check the Actions tab." > /dev/null
+          fi

@@ -20,7 +20,20 @@
 import { requireUser, jsonResponse, CORS_HEADERS } from "../_shared/auth.ts";
 import { ICON_NAMES } from "../_shared/icons.ts";
 
-const DEFAULT_MODEL = "gemini-3.5-flash"; // keep in sync with engine/script_generator.py
+// BUGFIX: this was "gemini-3.5-flash" — a name with no free tier (and
+// possibly no existence at all), while engine/script_generator.py's own
+// DEFAULT_GEMINI_MODEL had already been fixed to "gemini-2.5-flash". The
+// comment below promised these would be kept in sync; they weren't, which
+// is exactly why "Create Video" in the dashboard could keep failing with a
+// 404/model-not-found even while the GitHub Actions pipeline (which uses
+// the Python engine, not this file) worked fine — they are two separate
+// implementations hitting Gemini.
+const DEFAULT_MODEL = "gemini-2.5-flash"; // keep in sync with engine/script_generator.py's DEFAULT_GEMINI_MODEL
+// One-shot fallback if the configured/default model 404s — mirrors
+// engine/model_registry.py's FREE_TIER_PREFERRED list (the two models with
+// a confirmed free tier). GEMINI_MODEL, if set, is still tried first and
+// alone; this chain only kicks in if THAT 404s, same as the Python side.
+const MODEL_FALLBACK_CHAIN = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
 const RETRYABLE_STATUS = new Set([503, 500, 429]);
 const MAX_RETRIES = 4;
 const RETRY_BACKOFF_MS = 3000; // doubles each attempt: 3s, 6s, 12s, 24s
@@ -101,11 +114,7 @@ OUTPUT FORMAT (strict JSON, no extra markdown or commentary):
 }`.trim();
 }
 
-async function callGemini(systemPrompt: string, userPrompt: string) {
-  const apiKey = Deno.env.get("GEMINI_API_KEY");
-  if (!apiKey) throw new Error("GEMINI_API_KEY not configured as an Edge Function secret.");
-  const model = Deno.env.get("GEMINI_MODEL") || DEFAULT_MODEL;
-
+async function callGeminiOnce(model: string, apiKey: string, systemPrompt: string, userPrompt: string) {
   let lastErrorText = "";
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     const resp = await fetch(
@@ -132,10 +141,10 @@ async function callGemini(systemPrompt: string, userPrompt: string) {
     lastErrorText = body;
 
     if (resp.status === 404 || body.toLowerCase().includes("not found")) {
-      throw new Error(
-        `Gemini model '${model}' not found (${resp.status}). It's likely been deprecated — set the ` +
-        `GEMINI_MODEL secret to a current model from https://ai.google.dev/gemini-api/docs/models. Raw: ${body}`,
-      );
+      // Thrown as a typed object (not a plain Error) so callGemini() below
+      // can tell "this model is dead" apart from every other failure and
+      // decide whether to try the next one in the fallback chain.
+      throw { modelNotFound: true, model, status: resp.status, body };
     }
 
     // Confirmed in practice: Gemini's "503 UNAVAILABLE... currently
@@ -151,6 +160,37 @@ async function callGemini(systemPrompt: string, userPrompt: string) {
     throw new Error(`Gemini API error ${resp.status}: ${body}`);
   }
   throw new Error(`Gemini API error after ${MAX_RETRIES} attempts: ${lastErrorText}`);
+}
+
+async function callGemini(systemPrompt: string, userPrompt: string) {
+  const apiKey = Deno.env.get("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("GEMINI_API_KEY not configured as an Edge Function secret.");
+
+  // A pinned GEMINI_MODEL is an explicit choice — try it alone, same as the
+  // Python engine does, and don't silently override it on a 404.
+  const pinned = Deno.env.get("GEMINI_MODEL");
+  const chain = pinned ? [pinned] : MODEL_FALLBACK_CHAIN;
+
+  let lastNotFound: { model: string; status: number; body: string } | null = null;
+  for (const model of chain) {
+    try {
+      return await callGeminiOnce(model, apiKey, systemPrompt, userPrompt);
+    } catch (e) {
+      if (e && typeof e === "object" && (e as any).modelNotFound) {
+        lastNotFound = e as any;
+        console.log(`Gemini model '${model}' not found (${lastNotFound.status}) — ` +
+          (chain.indexOf(model) < chain.length - 1 ? "trying next model in the fallback chain." : "no more models to try."));
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  throw new Error(
+    `Gemini model '${lastNotFound?.model}' not found (${lastNotFound?.status}). It's likely been ` +
+    `deprecated, and every fallback model also failed — set the GEMINI_MODEL secret to a current ` +
+    `model from https://ai.google.dev/gemini-api/docs/models. Raw: ${lastNotFound?.body}`,
+  );
 }
 
 Deno.serve(async (req: Request) => {
