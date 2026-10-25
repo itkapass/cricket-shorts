@@ -33,7 +33,13 @@ const DEFAULT_MODEL = "gemini-2.5-flash"; // keep in sync with engine/script_gen
 // engine/model_registry.py's FREE_TIER_PREFERRED list (the two models with
 // a confirmed free tier). GEMINI_MODEL, if set, is still tried first and
 // alone; this chain only kicks in if THAT 404s, same as the Python side.
-const MODEL_FALLBACK_CHAIN = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+// BUGFIX: Google has since retired gemini-2.5-flash too (confirmed: live
+// calls now 404 with "no longer available to new users", recommending
+// gemini-3.8-flash). Unlike the Python engine, this file has no live
+// ListModels discovery, so the fallback chain is a static list that WILL
+// go stale again — add the next generation's name whenever Google's error
+// message names one, the same way this one was added.
+const MODEL_FALLBACK_CHAIN = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.8-flash"];
 const RETRYABLE_STATUS = new Set([503, 500, 429]);
 const MAX_RETRIES = 4;
 const RETRY_BACKOFF_MS = 3000; // doubles each attempt: 3s, 6s, 12s, 24s

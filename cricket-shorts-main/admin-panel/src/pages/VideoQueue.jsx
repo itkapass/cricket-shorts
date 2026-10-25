@@ -46,6 +46,54 @@ async function publishNow(video, setBusy, setMsg) {
 // the video leaves the auto-publish pipeline. Used when a video belongs on a
 // different channel, on another platform, or should go out at a moment you
 // choose.
+// Pulls an 11-char YouTube video id out of whatever URL shape someone
+// pastes (youtu.be/..., /watch?v=..., /shorts/...) so youtube_id is stored
+// correctly rather than left blank — the Published tab badge and future
+// analytics syncs key off youtube_id, not the raw URL string.
+function extractYoutubeId(url) {
+  const m = String(url || '').match(/(?:v=|\/shorts\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/)
+  return m ? m[1] : null
+}
+
+// Closes the loop that manual export opens: a video marked 'needs_manual'
+// gets zipped up for you to upload yourself, but nothing was ever able to
+// tell the app it actually went out. Without this, that video stays an
+// invisible 'needs_manual' row forever — live on YouTube, earning real
+// views, with zero connection drawn back to it here. This is the direct
+// fix for "a video published and the app has no idea."
+async function markManuallyPublished(video, setBusy, setMsg) {
+  const url = prompt(
+    `Paste the YouTube URL for "${video.title}" now that you've uploaded it yourself:`
+  )
+  if (!url || !url.trim()) return
+  const youtubeId = extractYoutubeId(url)
+  if (!youtubeId) {
+    alert('Could not find a YouTube video id in that URL. Expected something like ' +
+          'youtube.com/shorts/XXXXXXXXXXX, youtube.com/watch?v=XXXXXXXXXXX, or youtu.be/XXXXXXXXXXX.')
+    return
+  }
+  setBusy(video.id)
+  setMsg('')
+  try {
+    const { error } = await supabase
+      .from('videos')
+      .update({
+        status: 'published',
+        youtube_url: url.trim(),
+        youtube_id: youtubeId,
+        published_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', video.id)
+    if (error) throw error
+    setMsg('Marked as published \u2014 it now shows up in the Published tab with a working link.')
+  } catch (e) {
+    setMsg('Could not mark as published: ' + e.message)
+  } finally {
+    setBusy(null)
+  }
+}
+
 async function requestManualExport(video, setBusy, setMsg) {
   setBusy(video.id)
   setMsg('')
@@ -106,6 +154,21 @@ const TAB_EXPLANATIONS = {
     'Generation failures and publish failures together. Each card explains ' +
     'why \u2014 most are either a Gemini quota limit (self-resolving) or Gemini ' +
     'being briefly overloaded (503, also self-resolving on retry).',
+  // BUGFIX: this tab did not exist at all — a video routed to manual
+  // posting (the channel's publish_mode is 'manual', or no channel accepts
+  // its category) was only ever visible buried in All History, with no
+  // action available once you'd actually uploaded it yourself. That is
+  // exactly how a video ends up live on YouTube, with real views, and
+  // completely untracked here: nothing ever told the app it happened.
+  needs_manual:
+    'Approved, but the destination channel is set to manual posting (or no ' +
+    'channel currently accepts its category) \u2014 so it was packaged into a ' +
+    'downloadable zip (video, captions, hashtags, checklist) as a GitHub ' +
+    'Actions artifact on the Publish Approved Videos workflow run, instead ' +
+    'of being uploaded automatically. Once you upload it yourself, paste the ' +
+    'YouTube link back in here with "Mark as Published" \u2014 otherwise it ' +
+    'stays invisible outside this tab forever, with no link to the real ' +
+    'video.',
 }
 
 // Tabs where the useful number is "how many happened since I last looked"
@@ -175,6 +238,7 @@ export default function VideoQueue() {
       approved:          ['approved'],
       published:         ['published'],
       failed:            ['failed', 'publish_failed'],
+      needs_manual:      ['needs_manual'],
     }
     const entries = await Promise.all(
       Object.entries(statuses).map(async ([key, statusList]) => {
@@ -359,6 +423,7 @@ export default function VideoQueue() {
           { id: 'rendering', label: 'Rendering' },
           { id: 'pending', label: 'Pending Review' },
           { id: 'approved', label: 'Approved & Scheduled' },
+          { id: 'needs_manual', label: 'Needs Manual Upload' },
           { id: 'published', label: 'Published' },
           { id: 'failed', label: 'Failed', danger: true },
           { id: 'all', label: 'All History' }
@@ -740,6 +805,19 @@ export default function VideoQueue() {
                               Move Back to Pending
                             </button>
                           </>
+                        )}
+
+                        {video.status === 'needs_manual' && (
+                          <button
+                            className="btn btn-sm publish-now-btn"
+                            disabled={publishBusy === video.id}
+                            title="Only use this after you've actually uploaded the exported zip to YouTube yourself"
+                            onClick={() => markManuallyPublished(video, setPublishBusy, setPublishMsg)}
+                          >
+                            {publishBusy === video.id
+                              ? <><Loader2 size={14} className="spin" /> Saving…</>
+                              : <><Send size={14} /> Mark as Published</>}
+                          </button>
                         )}
 
                         {video.status === 'published' && video.youtube_url && (

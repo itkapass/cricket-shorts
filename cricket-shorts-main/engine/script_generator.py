@@ -213,6 +213,9 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
     # One alternative-model retry per call, tracked in a dict so the inner
     # loop can set it without a `nonlocal` declaration.
     _model_retried = {"done": False}
+    # Every model name already ruled out this call (404'd or 429'd), so a
+    # 404-triggered retry never loops back to a name it already proved dead.
+    _tried_models = {model_name}
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = client.models.generate_content(
@@ -263,24 +266,28 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
             last_error = e
             code = getattr(e, "code", None)
             if code == 404 or "not found" in str(e).lower() or "deprecated" in str(e).lower():
-                # BUGFIX — this used to give up immediately, even though the
-                # 429 branch right below already knows how to pick a
-                # different model and try again. A 404 here means Google
-                # has retired THIS specific name (ListModels can keep
-                # advertising a name for a while after generateContent stops
-                # honoring it), not that Gemini itself is unavailable. If a
-                # pin (GEMINI_MODEL) caused this, don't silently override the
+                # BUGFIX — this used to give up after at most ONE alternate
+                # model (sharing _model_retried with the 429 branch), which
+                # isn't enough: Google can retire a whole model GENERATION
+                # at once (2.0, then later all of 2.5), and ListModels can
+                # keep advertising a dead name for a while after
+                # generateContent stops honoring it. So the second model
+                # tried can ALSO 404. Loop through _tried_models, excluding
+                # each dead name via mark_model_exhausted, until either one
+                # works, the registry runs out of distinct candidates, or we
+                # hit the attempt budget — instead of stopping after one. If
+                # a pin (GEMINI_MODEL) caused this, don't override the
                 # user's explicit choice — that's exactly what "pinning"
-                # means. But an auto-discovered name that turns out to be
-                # dead should be crossed off and retried, same as a 429.
-                if not _model_retried.get("done") and not get("GEMINI_MODEL"):
+                # means, so only auto-discovered names get this treatment.
+                if not get("GEMINI_MODEL"):
+                    _tried_models.add(model_name)
                     model_registry.mark_model_exhausted(model_name)
                     alternative = model_registry.choose_text_model(
                         _active_api_key.get("key"), force_refresh=True)
-                    if alternative and alternative != model_name:
-                        _model_retried["done"] = True
+                    if alternative and alternative not in _tried_models and attempt < MAX_RETRIES:
                         print(f"[script_generator] \u26a0 '{model_name}' 404'd (likely "
-                              f"retired) — retrying once on '{alternative}'.")
+                              f"retired) — retrying on '{alternative}' "
+                              f"({len(_tried_models)} model(s) already ruled out today).")
                         model_name = alternative
                         continue
                 raise RuntimeError(
