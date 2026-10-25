@@ -182,6 +182,38 @@ def _get_client(api_key: str = None):
     return client, model_name
 
 
+def _try_backup_providers(system_prompt, user_prompt, temperature):
+    """Tries every configured free backup (Groq, then GitHub Models — see
+    llm_router.py) for ONE call. Returns a _ModelResponse on success, or
+    (None, explanatory_note) if nothing could answer — including the case
+    where nothing is configured at all. Shared by both the 429 branch
+    (Gemini quota genuinely gone) and the 404 branch (Gemini model name
+    genuinely dead / every candidate exhausted) below, since from here on
+    both are the same situation: Gemini cannot answer THIS call, so try
+    anything else that can before giving up entirely.
+    """
+    if not llm_router.any_backup_available():
+        return None, (
+            "No backup provider is configured, so there was nothing to fall back to. "
+            "See docs/13_BACKUP_AI_PROVIDER.md to add one (free, ~2 minutes) so a "
+            "day like this does not block testing again."
+        )
+    print(f"[script_generator] Trying configured backup providers for this call...")
+    try:
+        text, provider_name = llm_router.call(system_prompt, user_prompt, temperature)
+        print(f"[script_generator] \u2713 Backup provider '{provider_name}' answered. "
+              f"This result is tagged '{provider_name}', not 'gemini', wherever it is saved.")
+        return _ModelResponse(text, provider_name), None
+    except Exception as backup_err:
+        print(f"[script_generator] \u2717 Every backup provider also failed: {backup_err}")
+        return None, (
+            f"At least one backup provider IS configured and was tried, but every "
+            f"configured one also failed:\n{backup_err}\n\n"
+            f"Check the relevant key (console.groq.com/keys for Groq; `models: read` "
+            f"permission for GitHub Models)."
+        )
+
+
 def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature=None):
     """Calls Gemini and retries transient failures.
 
@@ -290,12 +322,25 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
                               f"({len(_tried_models)} model(s) already ruled out today).")
                         model_name = alternative
                         continue
+
+                # BUGFIX — every Gemini model candidate is now confirmed
+                # dead (or GEMINI_MODEL is pinned and THAT died), and this
+                # used to just give up right here. That left the free Groq/
+                # GitHub Models backup configured in Settings completely
+                # unused for exactly the situation it exists for: Gemini
+                # itself is unreachable this call, regardless of WHY.
+                backup_response, backup_note = _try_backup_providers(
+                    system_prompt, user_prompt, temperature)
+                if backup_response:
+                    return backup_response
+
                 raise RuntimeError(
                     f"Gemini model call failed, likely because the model name is no longer "
                     f"available: {e}\n"
                     f"Fix: set GEMINI_MODEL to a currently-supported model name. Check "
                     f"https://ai.google.dev/gemini-api/docs/models for the current lineup. "
-                    f"This project's default is '{model_name}'."
+                    f"This project's default is '{model_name}'.\n\n"
+                    f"{backup_note}"
                 ) from e
 
             if code == 429:
@@ -333,39 +378,11 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
                 # Genuine daily exhaustion. Try every configured free
                 # backup, in order (Groq, then GitHub Models — see
                 # llm_router.py), before giving up.
-                backup_failure_detail = None
-                if llm_router.any_backup_available():
-                    print(f"[script_generator] Gemini's daily quota is gone. "
-                          f"Trying configured backup providers for this call...")
-                    try:
-                        text, provider_name = llm_router.call(system_prompt, user_prompt, temperature)
-                        print(f"[script_generator] \u2713 Backup provider '{provider_name}' answered. "
-                              f"This result is tagged '{provider_name}', not 'gemini', wherever it is saved.")
-                        return _ModelResponse(text, provider_name)
-                    except Exception as backup_err:
-                        print(f"[script_generator] \u2717 Every backup provider also failed: {backup_err}")
-                        # Recorded so the FINAL error (below) can say what
-                        # actually happened, not just "not configured" —
-                        # those are two completely different problems with
-                        # two completely different fixes, and collapsing
-                        # them into one message meant every failure looked
-                        # like a missing key even when a real key was
-                        # present and had its own separate problem.
-                        backup_failure_detail = str(backup_err)
-
-                if backup_failure_detail:
-                    backup_note = (
-                        f"At least one backup provider IS configured and was tried, but every "
-                        f"configured one also failed:\n{backup_failure_detail}\n\n"
-                        f"Check the relevant key (console.groq.com/keys for Groq; `models: read` "
-                        f"permission for GitHub Models)."
-                    )
-                else:
-                    backup_note = (
-                        f"No backup provider is configured, so there was nothing to fall back to. "
-                        f"See docs/13_BACKUP_AI_PROVIDER.md to add one (free, ~2 minutes) so a "
-                        f"day like this does not block testing again."
-                    )
+                print(f"[script_generator] Gemini's daily quota is gone.")
+                backup_response, backup_note = _try_backup_providers(
+                    system_prompt, user_prompt, temperature)
+                if backup_response:
+                    return backup_response
 
                 raise RuntimeError(
                     f"Gemini daily quota exhausted (429 RESOURCE_EXHAUSTED).\n\n"
