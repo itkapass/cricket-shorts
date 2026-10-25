@@ -1,0 +1,52 @@
+# =============================================================================
+# BACKUP SCHEDULER — GitLab CI
+# =============================================================================
+# This is a SAFETY NET, not a second copy of the pipeline. GitHub Actions stays
+# the primary scheduler (it is free, proven here, and needs no server). This
+# exists for the two ways GitHub can stop running your jobs through no fault of
+# your own:
+#
+#   1. A GitHub Actions outage.
+#   2. The repository hitting a usage cap, or GitHub auto-disabling scheduled
+#      workflows after ~60 days with no repository activity.
+#
+# It calls the SAME code in this same repository — `python -m engine.publish_approved`
+# — not a reimplementation. There is nothing here to keep in sync with the
+# GitHub workflows beyond the secret names.
+#
+# IMPORTANT: leave this DISABLED until you actually need it. Two schedulers
+# running the same publish job at once would double-post. The publish code's
+# own spacing check (engine/channels.ready_to_publish) makes that unlikely
+# rather than impossible, and "unlikely" is not what you want pointed at your
+# YouTube channel. Setup instructions: docs/19_BACKUP_SCHEDULER_GITLAB.md
+# =============================================================================
+
+stages:
+  - publish
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+
+publish_approved:
+  stage: publish
+  image: python:3.11-slim
+  # `rules` with `$BACKUP_SCHEDULER_ENABLED == "true"` means this job does
+  # nothing at all until you set that CI/CD variable — so merely having this
+  # file in the repo cannot double-post anything.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $BACKUP_SCHEDULER_ENABLED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'      # manual "Run pipeline" button, always allowed
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null
+    - pip install --quiet -r requirements.txt
+  script:
+    - echo "Backup scheduler — publishing one approved video if the spacing gap has passed."
+    - python -m engine.publish_approved
+  # Never fail the pipeline red just because there was nothing to publish; a
+  # quiet exit is the normal, expected outcome most of the time.
+  allow_failure: false
+  timeout: 30 minutes

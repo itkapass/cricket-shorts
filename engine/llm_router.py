@@ -18,6 +18,7 @@ available() and raises a clear, combined error only if NONE of them work.
 """
 from engine import backup_provider
 from engine import github_models_provider
+from engine import openrouter_provider
 
 
 # Ordered (name, module) pairs — add a new free backup by adding one line
@@ -25,6 +26,11 @@ from engine import github_models_provider
 _CHAIN = [
     ("groq", backup_provider),
     ("github_models", github_models_provider),
+    # ADDED: one key reaches dozens of models, several with a genuine free
+    # tier, so this single link is itself diversified. Last in the chain
+    # because by the time a call gets here everything else has already
+    # refused it. See engine/openrouter_provider.py.
+    ("openrouter", openrouter_provider),
 ]
 
 

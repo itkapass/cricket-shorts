@@ -134,3 +134,13 @@ def performance_synced(sync_result: dict, follow_up_result: dict, avg_views: flo
         lines.append(f"**{standouts}** standout video(s) found → **{spawned}** new, "
                      f"genuinely different follow-up topic(s) added to the pool.")
     write("\n".join(lines))
+
+
+def note(text: str):
+    """One plain line on the run's Summary tab. Used for things that are
+    neither a topic nor a video — currently the performance-learning
+    summary (engine/insights.summarize), so every run states in writing what
+    it learned from the channel's real numbers and whether it acted on it."""
+    if not text:
+        return
+    write(f"\n> {text}\n")

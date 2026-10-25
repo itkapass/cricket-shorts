@@ -40,6 +40,10 @@ _env = {
     "GEMINI_MODEL":             os.getenv("GEMINI_MODEL"),
     "GEMINI_TEMPERATURE":       os.getenv("GEMINI_TEMPERATURE"),
     "GROQ_API_KEY":             os.getenv("GROQ_API_KEY"),
+    # Last link in the free LLM fallback chain — see engine/llm_router.py and
+    # engine/openrouter_provider.py. Free key, no card: openrouter.ai/keys
+    "OPENROUTER_API_KEY":       os.getenv("OPENROUTER_API_KEY"),
+    "OPENROUTER_MODEL":         os.getenv("OPENROUTER_MODEL"),
     "GROQ_MODEL":               os.getenv("GROQ_MODEL"),
     "HUGGINGFACE_API_KEY":      os.getenv("HUGGINGFACE_API_KEY"),
     "HUGGINGFACE_IMAGE_MODEL":  os.getenv("HUGGINGFACE_IMAGE_MODEL"),

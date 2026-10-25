@@ -29,28 +29,16 @@ made-by-a-person because it is: nothing in this file invents pixels, it only
 arranges real ones.
 
 WHICH FRAME GETS USED
-CHANGED after a real channel review showed most thumbnails looking near-
-identical: "stat" scenes are drawn by engine/styles/sports_visual.py as a
-DESIGNED CARD, not a photo — same background gradient, same layout, every
-single time (only the number/words on it change). Almost every video in
-this persona's archetypes has a stat scene, so picking it FIRST, every
-time, meant most of the channel's thumbnails were the same teal card with
-different text — exactly the "thumbnails look the same" complaint. A real,
-specific photo/clip varies naturally from video to video and is a better
-answer to "engaging, well reachable, related" than a repeated template.
-New priority, in order:
-  1. Any scene with a REAL fetched photo/clip (_visual_source is wikimedia/
-     pexels/cache/pixabay — see orchestrator.py, which folds this onto each
-     storyboard scene right after the visual-fetch step). A named-subject
-     Wikimedia photo is preferred first within this group when more than
-     one qualifies, since that is the most specific, least generic shot
-     available — a real photo of the actual player/ground/moment.
-  2. The "stat" scene, if this video has one and no real photo qualified —
-     scene_kind == "stat" is, by design (see archetypes.py /
-     script_generator.py), the single biggest, most quotable number or
-     record in the whole video, and still a perfectly good fallback.
-  3. The opening hook (scene_number == 1), regardless of its visual source.
-  4. Whichever scene actually has footage, as a last resort.
+Preferring, in order:
+  1. The "stat" scene, if this video has one — scene_kind == "stat" is, by
+     design (see archetypes.py / script_generator.py), the single biggest,
+     most quotable number or record in the whole video. That is exactly the
+     kind of specific, high-curiosity moment that makes someone stop
+     scrolling, so it is the best possible thumbnail frame when it exists.
+  2. The opening hook (scene_number == 1), which is almost always the
+     video's own named subject — a specific player or ground, not an
+     abstract idea (see personas.py's flavor_instructions).
+  3. Whichever scene actually has footage, as a last resort.
 A frame partway through that scene (not its very first instant, which is
 often mid-transition/fade) is grabbed directly from the final rendered
 video with ffmpeg, so what's captured is always a clean, fully-loaded shot.
@@ -114,39 +102,16 @@ def _font(size: int, bold: bool = True):
         return ImageFont.load_default()
 
 
-# Real-photo/clip sources, as folded onto each scene by orchestrator.py's
-# `sb_scene["_visual_source"] = rendered_scene.get("source")` line — every
-# OTHER value ("designed_card", "ai_generated", FALLBACK_CLIP_TYPE, or
-# simply missing on styles that skip visual-fetch entirely) is NOT a real,
-# distinctive photo and should not outrank one. "wikimedia" goes first
-# within this set because a named-subject Wikimedia match is the most
-# specific, least generic shot this pipeline can produce.
-_REAL_PHOTO_SOURCES_BY_PRIORITY = ("wikimedia", "pexels", "cache", "pixabay_video", "pixabay_photo")
-
-
 def _pick_source_scene(storyboard: dict) -> dict | None:
     scenes = [s for s in (storyboard.get("scenes") or []) if s.get("time_end") is not None]
     if not scenes:
         return None
 
-    normal = [s for s in scenes if (s.get("scene_kind") or "").lower() not in ("stat", "quiz")]
-
-    # 1. A real, specific photo/clip beats a repeated template — see the
-    #    module docstring's "WHICH FRAME GETS USED" for why this moved to
-    #    the top. Scan in source-priority order so a named Wikimedia photo
-    #    wins over a generic Pexels/Pixabay keyword match when both exist.
-    for source in _REAL_PHOTO_SOURCES_BY_PRIORITY:
-        for s in normal:
-            if (s.get("_visual_source") or "") == source:
-                return s
-
-    # 2. No real photo anywhere in this video — the designed stat card is
-    #    still a good, legible, on-brand fallback.
     stat = [s for s in scenes if (s.get("scene_kind") or "").lower() == "stat"]
     if stat:
         return stat[0]
 
-    # 3. The opening hook, whatever its visual source.
+    normal = [s for s in scenes if (s.get("scene_kind") or "").lower() not in ("stat", "quiz")]
     hook = [s for s in normal if s.get("scene_number") == 1]
     if hook:
         return hook[0]

@@ -133,3 +133,80 @@ def normalize(storyboard: dict, archetype: str) -> dict:
             last["scene_kind"] = "quiz"
 
     return storyboard
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUGFIX — the CTA only ever reached two of the formats.
+#
+# script_generator used to call prompt_block() only when
+# `archetype in arch.QUIZ_CLOSE_ARCHETYPES`, and pass "" otherwise. So a
+# rules-explainer, a myth-bust or a records video was never told to ask the
+# viewer for anything, and reliably didn't. The channel's real numbers show
+# the result plainly: dozens of published Shorts, zero comments on any of them.
+#
+# The quiz mechanic genuinely should stay reserved for the formats built
+# around it — bolting a trivia question onto a rules explainer makes it feel
+# like a gimmick, which was the right call. The mistake was concluding that
+# the OTHER formats should therefore close on nothing at all. They each get a
+# closing ask that suits them instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Written as a menu the model chooses from, not a line it copies. A channel
+# that ends every video with the identical sentence reads as a bot — which is
+# the exact failure prompt_block() already warns about for the quiz formats.
+_GENERAL_CTA_MENU = """
+
+CLOSING ASK — REQUIRED ON THE FINAL SCENE:
+End on ONE short, specific ask. Pick whichever genuinely fits what this video
+just said, and phrase it in your own words — do NOT copy these verbatim, and
+do not use the same shape of sentence every video:
+
+  - SHARE, aimed at a specific person: name the kind of person who would care
+    about this exact fact ("send this to the one friend who still argues
+    about the no-ball rule"). A named recipient is shared far more than a
+    generic "share this".
+  - COMMENT, asking for something only the viewer has: an opinion, a memory,
+    a call they disagree with ("was the umpire right? tell me below").
+    Ask for a judgement, never for a fact the video already gave.
+  - COMMENT, asking the viewer to pick a side between two things the video
+    named ("Bumrah's or Starc's? pick one").
+
+RULES:
+  - ONE ask only. Two asks split the audience and get neither.
+  - It must connect to THIS video's content. A generic "like and subscribe"
+    is worth nothing and makes the channel look automated — never write one.
+  - Keep it under about 12 words. It is the last thing heard, not a speech.
+  - Never ask a question the video already answered.
+"""
+
+
+def cta_block(archetype: str) -> str:
+    """The closing-engagement instructions for ANY archetype.
+
+    Returns the full quiz mechanic for the formats built around it, and the
+    lighter general ask for every other format. Never returns "" — every
+    video gets some closing ask, which is the whole point of the fix.
+    """
+    from engine import archetypes as arch
+    if archetype in arch.QUIZ_CLOSE_ARCHETYPES:
+        return prompt_block(archetype)
+    return _GENERAL_CTA_MENU
+
+
+def has_closing_ask(storyboard: dict) -> bool:
+    """True if the final scene actually contains a closing ask.
+
+    Used by quality_gates so a missing CTA is caught and reported instead of
+    silently shipping — previously nothing anywhere verified that the CTA
+    instructions had been followed, which is why nobody noticed they were
+    only being sent to two of the formats.
+    """
+    scenes = (storyboard or {}).get("scenes") or []
+    if not scenes:
+        return False
+    text = (scenes[-1].get("voice_text") or "").lower()
+    if "?" in text:
+        return True
+    asks = ("comment", "tell me", "tell us", "share", "send this", "send it",
+            "pick one", "who do you", "let me know", "drop a", "below")
+    return any(a in text for a in asks)

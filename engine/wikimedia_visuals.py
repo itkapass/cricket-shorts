@@ -99,6 +99,15 @@ def _image_info(titles: list) -> list:
         out.append({
             "title": page.get("title"), "url": info["url"],
             "width": info.get("width", 0), "height": info.get("height", 0),
+            # FIXED: `extmetadata` was already being REQUESTED on the line
+            # above and then silently discarded, so the licence arrived in
+            # every response and was never read — this module filtered on
+            # filename and image size only. Commons is overwhelmingly free
+            # media, but it also carries fair-use files, trademarked logos,
+            # non-commercial-only uploads and files pending deletion, and
+            # "overwhelmingly" is not something a monetised channel can rely
+            # on. engine/image_license.py now reads this.
+            "extmetadata": info.get("extmetadata") or {},
         })
     return out
 
@@ -125,12 +134,34 @@ def fetch_photo_for_scene(query: str, duration_needed: float, job_id: str,
     if not query:
         return None
 
+    # Part 1E: some subjects must never be SEARCHED for, not merely filtered
+    # out of the results — a correctly-licensed photograph of a film poster
+    # is still a picture of a film poster.
+    try:
+        from engine import image_license
+        if image_license.is_banned_subject(query):
+            return None
+    except ImportError:
+        image_license = None
+
     try:
         titles = _search_image_titles(query)
         candidates = _image_info(titles)
     except Exception as e:
         print(f"[wikimedia_visuals] ⚠ Search failed for '{query}': {e}")
         return None
+
+    # THE LICENCE GATE. Runs before an image can become a scene, which is
+    # what Part 1E requires ("this filter runs before an image is ever placed
+    # in a video"). An unrecognised or missing licence fails.
+    if image_license is not None:
+        before = len(candidates)
+        candidates = image_license.filter_candidates(candidates)
+        if not candidates:
+            print(f"[wikimedia_visuals] No freely-licensed image for '{query}' "
+                  f"({before} candidate(s) all failed the licence check). "
+                  f"Falling through to the next visual provider.")
+            return None
 
     # Prefer a reasonably large image — Commons has plenty of thumbnail-only
     # uploads that would look soft once cropped to a 1080-wide frame.

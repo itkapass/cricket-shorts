@@ -75,7 +75,8 @@ from engine import step_summary
 from engine import brief as brief_mod
 from engine import channels as channels_mod
 from engine import content_mix
-from engine import performance_loop
+from engine import performance_loop  # noqa: F401  (used via insights, below)
+from engine import insights
 from engine import visual_usage
 from engine import thumbnail_generator
 from engine.styles import is_multi_voice
@@ -447,6 +448,29 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
     avoid_list = concept_memory.avoid_list_for_prompt(ledger)
     print(f"[orchestrator] Concept ledger: {len(ledger)} ideas already used.")
 
+    # ───────────────────────────────────────────────────────────────────────
+    # FIXED (Part 4.4) — the feedback loop is now actually connected.
+    #
+    # Computed ONCE per run, not once per video: it is a read over the whole
+    # published history and nothing about it changes between videos in the
+    # same batch. It is also logged to `insight_log` and printed to the
+    # Actions Summary tab, so there is always a readable answer to "why did
+    # the channel start writing hooks like this" rather than a silent drift.
+    # ───────────────────────────────────────────────────────────────────────
+    run_insight_block = ""
+    try:
+        _findings = insights.compute(db)
+        run_insight_block = insights.prompt_block(db)
+        print(f"[orchestrator] {insights.summarize(db)}")
+        if run_insight_block:
+            insights.log_decisions(db, _findings, applied_to="script_generation")
+        step_summary.note(insights.summarize(db))
+    except Exception as e:
+        # Learning from history is an improvement, never a requirement. A
+        # channel with no history at all must still make videos.
+        print(f"[orchestrator] ⚠ Performance learning unavailable this run ({e}) — "
+              f"writing without it, exactly as before.")
+
     successful, attempted = 0, 0
     gate_rejected, concept_rejected = 0, 0
     errors = []
@@ -563,10 +587,22 @@ def run_generation_pipeline(manual_count: int = None, skip_topics: bool = False,
                                                        persona_key=persona_key, api_key=gemini_key)
 
             # STAGE 2: write it.
+            #
+            # FIXED (Part 4.4): `insight_block` is this channel's own
+            # measured performance, turned into writing guidance — which
+            # hook style, which pacing, which format actually got views and
+            # kept people watching. Before this, analytics were collected
+            # and scored and then read by nothing: topic_synthesizer.py and
+            # script_generator.py contained zero references to video_stats
+            # or engagement_score, so the "smart" loop changed nothing about
+            # what got written. It is "" until the channel has enough
+            # history to say something trustworthy, and "" writes exactly as
+            # the old code did. See engine/insights.py.
             storyboard = generate_storyboard(
                 topic, tone, num_scenes=5, render_style=render_style,
                 archetype=archetype, avoid_list=avoid_list, structure=structure,
                 creative_brief=creative_brief, api_key=gemini_key, temperature=temperature,
+                insight_block=run_insight_block,
             )
 
             # Reject repeats BEFORE rendering. Checking after would waste the
@@ -1015,6 +1051,25 @@ def _load_settings(db: Client) -> dict:
     return {row["key"]: row["value"] for row in rows} if rows else {}
 
 
+def _classify_for_metadata(storyboard: dict) -> dict:
+    """insights.classify(), but guaranteed never to raise and never to
+    insert a column that does not exist. A labelling failure must not cost a
+    finished render."""
+    try:
+        c = insights.classify(storyboard or {})
+        return {
+            "hook_style": c.get("hook_style"),
+            "hook_text": c.get("hook_text"),
+            "word_count": c.get("word_count"),
+            "pacing": c.get("pacing"),
+            "publish_slot_hour": None,  # stamped at publish time, not now
+        }
+    except Exception as e:
+        print(f"[orchestrator] ⚠ Could not classify this script for the "
+              f"performance loop ({e}) — saving the video without labels.")
+        return {}
+
+
 def _save_and_finalize(db, result, job_id, topic_id, tone_id, render_style, tone_name=None,
                        auto_approve=False, archetype=None, channel_id=None, structure=None,
                        creative_brief=None, persona_key=None, topic_label=None):
@@ -1063,6 +1118,25 @@ def _save_and_finalize(db, result, job_id, topic_id, tone_id, render_style, tone
     )
     initial_status = "approved" if safe_to_auto else "pending"
 
+    # ───────────────────────────────────────────────────────────────────────
+    # BUGFIX — THE AUTO-APPROVE BUG THAT MADE AUTO-APPROVE USELESS
+    #
+    # This used to set status='approved' and leave approved_at NULL, because
+    # approved_at was only ever written by the dashboard (VideoQueue.jsx).
+    # publish_approved.py then selected approved videos with
+    # `.order("approved_at", desc=False)`, and PostgreSQL sorts NULLs LAST on
+    # an ascending order. With publish_per_run = 1, that meant every
+    # auto-approved video sat permanently behind every hand-approved one —
+    # auto-approve "worked", its videos just never reached the front of the
+    # publish queue. That is a large part of the generated-vs-published gap.
+    #
+    # Two defences, because one alone is not enough:
+    #   1. stamp approved_at here (fixes everything made from now on)
+    #   2. publish_approved.py now sorts on COALESCE(approved_at, created_at)
+    #      in Python (fixes the rows already sitting in the queue)
+    # ───────────────────────────────────────────────────────────────────────
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     db.table("videos").insert({
         "job_id": job_id,
         "title": result["title"],
@@ -1089,7 +1163,15 @@ def _save_and_finalize(db, result, job_id, topic_id, tone_id, render_style, tone
         "topic_label": topic_label,  # YOUR grouping tag, e.g. "office"
         "channel_id": channel_id,
         "quality_verdict": gates.get("verdict"),
+        # FIXED (Part 5) — these five columns did not exist, which is why
+        # "compare performance across opening-hook style, script length/
+        # pacing and publish time slot" was impossible rather than merely
+        # broken: the inputs were never recorded. engine/insights.classify()
+        # labels them identically for every video forever, so last month's
+        # labels and this month's are genuinely comparable.
+        **_classify_for_metadata(result.get("storyboard")),
         "status": initial_status,
+        "approved_at": now_iso if safe_to_auto else None,
         "storyboard": json.dumps(result["storyboard"]),
         "captions_srt": result.get("captions_srt"),
         "flags": flags or None,  # native dict, NOT json.dumps() — see VideoQueue.jsx, which reads this as an object

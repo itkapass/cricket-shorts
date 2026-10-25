@@ -43,7 +43,18 @@ from engine import backup_provider
 
 # Gemini free tier daily request cap. Overridable via the GEMINI_DAILY_BUDGET
 # setting because Google changes this and paid tiers are far higher.
-DEFAULT_DAILY_BUDGET = 20
+#
+# BUGFIX: this was 20, which was wrong by more than 10x for the model this
+# app actually uses. gemini-2.5-flash's free tier allows ~250 requests/day
+# (the ~20/day figure belongs to the Pro models, which this app never calls
+# — see model_registry.FREE_TIER_PREFERRED). At 20, the tracker declared the
+# day over after roughly the 9th video-writing call, even though Google was
+# perfectly happy to keep answering, and everything after that silently went
+# to Groq. 200 leaves real headroom under the true 250 limit.
+#
+# This is only a LOCAL guess used to pace the run. The authority is always
+# Google's own 429 — see hard_stop().
+DEFAULT_DAILY_BUDGET = 200
 
 # Never spend the last few calls — leaves room for a retry and for the health
 # check, which also calls the model.
@@ -187,6 +198,13 @@ class BudgetTracker:
         to the next video guarantees another 429 and produces a queue full of
         identical red errors, which is what happened before this existed.
         """
+        # BUGFIX: hard_stop() used to be called for ANY 429 that was not
+        # explicitly per-minute. A model with NO free allowance at all also
+        # returns 429 — on the very first request of the day — so one bad
+        # model choice switched Gemini off for the entire Pacific day and
+        # pushed every video onto Groq. script_generator now tries a
+        # different model first (model_registry.mark_model_exhausted) and
+        # only reaches this once Google's own error says PerDay.
         self._hard_stopped = True
         # Assume the budget is gone; the exact remaining count is unknowable
         # from a 429 alone. This is now SAFE to do, because the counter is

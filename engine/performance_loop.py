@@ -47,8 +47,21 @@ from datetime import datetime, timezone, timedelta
 
 from engine import sports_catalog
 
-DEFAULT_VIEW_MULTIPLIER = 3.0
-DEFAULT_MIN_VIEWS = 200
+# ─────────────────────────────────────────────────────────────────────────────
+# FIXED — the standout bar was set so high that follow-ups essentially never
+# fired. On this channel's real numbers (39 published Shorts, recent average
+# around 210 views), the old rule of "at least 200 views AND at least 3x the
+# average" meant a video needed ~630 views to count. Four of thirty-nine
+# cleared it. A learning loop that triggers on one video in ten is not a
+# learning loop.
+#
+# 2.0x is still a genuine, visible standout — double the channel's own
+# average — while firing often enough to actually teach the system
+# something. The absolute floor drops to 120 for the same reason, and both
+# remain overridable from Settings.
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_VIEW_MULTIPLIER = 2.0
+DEFAULT_MIN_VIEWS = 120
 RECENT_WINDOW_DAYS = 14
 FOLLOW_UP_COUNT = 2  # per standout — enough variety, never a flood from one hit
 
@@ -197,14 +210,49 @@ def fetch_and_record_stats(video_row: dict, db, creds_override: dict = None) -> 
         views = int(stats.get("viewCount", 0))
         likes = int(stats.get("likeCount", 0))
         comments = int(stats.get("commentCount", 0))
+
+        # ───────────────────────────────────────────────────────────────────
+        # FIXED: `shares` used to be hardcoded 0 with a comment explaining
+        # that the Data API does not expose it. True — but it is available
+        # from the ANALYTICS API on the same credentials, along with the two
+        # numbers that matter most on Shorts and were previously invisible:
+        # average view percentage (how far through people watch) and
+        # subscribers gained. Those are what engine/insights.py compares
+        # pacing and hook style against.
+        #
+        # None (not 0) when unavailable, so an unreadable token never writes
+        # a fake "0% retention" that would poison every later comparison.
+        # ───────────────────────────────────────────────────────────────────
+        shares = 0
+        extra = {}
+        try:
+            from engine import youtube_analytics
+            adv = youtube_analytics.fetch_video_metrics(
+                youtube_id, video_row.get("published_at"), creds_override)
+            if adv:
+                shares = adv.get("shares") or 0
+                extra = {
+                    "avg_view_percentage": adv.get("avg_view_percentage"),
+                    "avg_view_duration": adv.get("avg_view_duration"),
+                    "subscribers_gained": adv.get("subscribers_gained"),
+                }
+                # The Analytics API is authoritative where the two disagree.
+                views = adv.get("views") or views
+                likes = adv.get("likes") or likes
+                comments = adv.get("comments") or comments
+        except Exception as e:
+            print(f"[performance_loop] (analytics extras unavailable for "
+                  f"{youtube_id}: {e}) — continuing with view/like/comment counts.")
+
         row = {
             "video_id": video_row["id"],
             "views": views,
             "likes": likes,
             "comments": comments,
-            "shares": 0,  # see score_video()'s docstring — not exposed by this API/scope
-            "engagement_score": score_video(views, likes, comments, 0),
+            "shares": shares,
+            "engagement_score": score_video(views, likes, comments, shares),
         }
+        row.update({k: v for k, v in extra.items() if v is not None})
         db.table("video_stats").insert(row).execute()
         return row
     except Exception as e:
@@ -358,9 +406,8 @@ Sport: {sport}
 Invent {n} genuinely different follow-up topics, same category and sport,
 that were NOT already covered by the original."""
 
-    client, model_name, resolved_key = _get_client(api_key)
-    response = _call_model_with_clear_errors(client, model_name, FOLLOW_UP_SYSTEM, user, temperature=0.9,
-                                               current_key=resolved_key)
+    client, model_name = _get_client(api_key)
+    response = _call_model_with_clear_errors(client, model_name, FOLLOW_UP_SYSTEM, user, temperature=0.9)
     ideas = _extract_json_array(response.text)
     return [
         {"name": i["name"].strip(), "description": i.get("description", "").strip(),
@@ -383,12 +430,22 @@ def spawn_follow_ups(db, api_key=None, persona_key: str = "cricket_and_sports") 
 
     try:
         avg_views = channel_average_views(db)
-        candidates = (
-            db.table("videos")
-            .select("id, job_id, topic_id, title, description, follow_up_spawned")
-            .eq("status", "published").eq("follow_up_spawned", False)
-            .execute().data
-        ) or []
+        # BUGFIX: this used `.eq("follow_up_spawned", False)`. Migration 007
+        # added that column with DEFAULT FALSE, but any video row created
+        # BEFORE 007 ran has it as NULL, and `= false` never matches NULL in
+        # SQL. Those videos were therefore invisible to the follow-up loop
+        # permanently, however well they performed. Selecting everything and
+        # filtering in Python treats NULL as "not yet spawned", which is what
+        # it actually means.
+        candidates = [
+            v for v in (
+                db.table("videos")
+                .select("id, job_id, topic_id, title, description, follow_up_spawned")
+                .eq("status", "published")
+                .execute().data
+            ) or []
+            if not v.get("follow_up_spawned")
+        ]
     except Exception as e:
         print(f"[performance_loop] ⚠ Could not load candidates for follow-up spawning: {e}")
         return {"checked": 0, "standouts": 0, "spawned": 0}

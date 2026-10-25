@@ -820,3 +820,165 @@ if __name__ == "__main__":
         print(f"{len(FAILED)} check(s) FAILED.")
         sys.exit(1)
     print(f"All {len(PASSED)} checks passed.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AUDIT FIXES — the four reported-broken areas, plus the Gemini problem.
+# Each check here corresponds to a specific bug found in the audit. See
+# WHAT_WAS_BROKEN_AND_FIXED.md for the full write-up of each one.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _audit_src(rel):
+    import io as _io, os as _os
+    return _io.open(_os.path.join(ROOT, rel), encoding="utf-8").read()
+
+
+def _audit_checks():
+    results = []
+
+    def c(name, ok, detail=""):
+        results.append((name, ok, detail))
+
+    orch = _audit_src("engine/orchestrator.py")
+    pub = _audit_src("engine/publish_approved.py")
+    sg = _audit_src("engine/script_generator.py")
+    mr = _audit_src("engine/model_registry.py")
+    budget = _audit_src("engine/api_budget.py")
+    eng = _audit_src("engine/engagement.py")
+    ins = _audit_src("engine/insights.py")
+    perf = _audit_src("engine/performance_loop.py")
+    tsyn = _audit_src("engine/topic_synthesizer.py")
+    ya = _audit_src("engine/youtube_analytics.py")
+    wiki = _audit_src("engine/wikimedia_visuals.py")
+    mig = _audit_src("supabase/migrations/009_performance_feedback_fixes.sql")
+
+    # ── AREA 1: auto-approve ────────────────────────────────────────────────
+    c("Area 1 — auto-approve stamps approved_at",
+      '"approved_at": now_iso if safe_to_auto else None' in orch,
+      "It used to set status='approved' and leave approved_at NULL, which the "
+      "publisher's ORDER BY approved_at ASC then sorted LAST.")
+    c("Area 1 — existing stranded rows are repaired",
+      "COALESCE(approved_at, created_at)" in mig)
+
+    # ── AREA 2: generated vs published ──────────────────────────────────────
+    c("Area 2 — publish queue no longer relies on NULL ordering",
+      "_queue_position" in pub and "sorted(candidates, key=_queue_position)" in pub)
+    c("Area 2 — the queue heals its own missing timestamps",
+      'db.table("videos").update({"approved_at": stamp})' in pub)
+    c("Area 2 — failed uploads are retried, not lost forever",
+      "_revive_retryable_failures" in pub,
+      "publish_failed and needs_manual were terminal statuses that nothing in "
+      "the codebase ever moved a row out of.")
+    c("Area 2 — retries are bounded and only fire on transient errors",
+      "MAX_PUBLISH_ATTEMPTS" in pub and "_RETRYABLE_FAILURE_MARKERS" in pub)
+    c("Area 2 — publish_attempts column exists",
+      "publish_attempts" in mig)
+
+    # ── AREA 3: engagement CTA ──────────────────────────────────────────────
+    c("Area 3 — every archetype gets a closing ask",
+      "def cta_block" in eng and "quiz_close_block = engagement.cta_block(archetype)" in sg,
+      "Only QUIZ_CLOSE_ARCHETYPES used to receive CTA instructions; every "
+      "other format got an empty string and asked for nothing.")
+    c("Area 3 — the non-quiz ask is a varied menu, not one fixed line",
+      "_GENERAL_CTA_MENU" in eng and "do NOT copy these verbatim" in eng)
+    c("Area 3 — the CTA can be verified rather than assumed",
+      "def has_closing_ask" in eng)
+
+    # ── AREA 4: the analytics feedback loop ─────────────────────────────────
+    c("Area 4 — insights module exists",
+      "def prompt_block" in ins and "def topic_bias_block" in ins)
+    c("Area 4 — performance reaches SCRIPT writing",
+      "insight_block=run_insight_block" in orch and "{insight_block}" in sg,
+      "script_generator.py previously had zero references to video_stats or "
+      "engagement_score.")
+    c("Area 4 — performance reaches TOPIC invention",
+      "performance_block" in tsyn and "insights.topic_bias_block" in tsyn,
+      "topic_synthesizer.py previously had zero references to measured "
+      "performance.")
+    c("Area 4 — performance_loop is no longer a dead import",
+      "from engine import insights" in orch)
+    c("Area 4 — hook style / pacing / slot are actually recorded",
+      "_classify_for_metadata" in orch and "hook_style" in mig and
+      "publish_slot_hour" in mig,
+      "Three of the five things Part 5 asks to compare had no columns at all, "
+      "so the comparison was impossible rather than broken.")
+    c("Area 4 — retention and shares are read from the Analytics API",
+      "averageViewPercentage" in ya and "youtube_analytics" in perf,
+      "shares was hardcoded to 0 and retention was invisible.")
+    c("Area 4 — the analytics scope is requested",
+      "yt-analytics.readonly" in _audit_src("engine/publisher.py"))
+    c("Area 4 — unmeasured values stay NULL, never 0",
+      "NULL means" in mig or "None (not 0)" in perf,
+      "A fabricated 0% retention would poison every comparison.")
+    c("Area 4 — findings need a real sample and a real effect",
+      "MIN_SAMPLE" in ins and "MIN_LIFT" in ins)
+    c("Area 4 — decisions are auditable",
+      "insight_log" in ins and "insight_log" in mig)
+    c("Area 4 — the standout bar is reachable on this channel",
+      "DEFAULT_VIEW_MULTIPLIER = 2.0" in perf and "DEFAULT_MIN_VIEWS = 120" in perf,
+      "3x with a 200-view floor needed ~630 views; 4 of 39 videos cleared it.")
+    c("Area 4 — NULL follow_up_spawned rows are visible again",
+      'if not v.get("follow_up_spawned")' in perf,
+      "`= false` never matches NULL, so pre-migration-007 videos were "
+      "permanently invisible to the follow-up loop.")
+
+    # ── GEMINI ──────────────────────────────────────────────────────────────
+    c("Gemini — dropped connections retry and fall back",
+      "_TRANSPORT_ERRORS" in sg and "httpx.RemoteProtocolError" in sg,
+      "'Server disconnected without sending a response' is not an APIError, "
+      "so it escaped both the retry loop and the Groq fallback.")
+    c("Gemini — models are picked by known free tier, not version number",
+      "FREE_TIER_PREFERRED" in mr,
+      "Newer Gemini models often have no free tier; a free key 429s on the "
+      "first request and the whole day gets written off.")
+    c("Gemini — a 429 tries another model before the day is abandoned",
+      "mark_model_exhausted" in sg and "def mark_model_exhausted" in mr)
+    c("Gemini — version guessing now prefers the OLDEST Flash model",
+      "most likely to still have a free tier" in mr)
+    c("Gemini — the default model has a real free tier",
+      'DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"' in sg)
+    c("Gemini — the daily budget matches reality",
+      "DEFAULT_DAILY_BUDGET = 200" in budget,
+      "20 is the Pro figure; gemini-2.5-flash allows ~250.")
+
+    # ── IMAGE LICENSING ─────────────────────────────────────────────────────
+    c("Licensing — extmetadata is kept, not discarded",
+      '"extmetadata": info.get("extmetadata")' in wiki,
+      "It was being requested from the API on every call and thrown away.")
+    c("Licensing — the gate runs before an image becomes a scene",
+      "image_license.filter_candidates" in wiki)
+
+    # ── KEEPALIVE ───────────────────────────────────────────────────────────
+    ka = _audit_src(".github/workflows/keepalive.yml")
+    c("Keepalive — it now pings Supabase as well as GitHub",
+      "rest/v1/settings" in ka,
+      "It only ever kept the GitHub repo active; there was no database call "
+      "anywhere in the file, despite free Supabase pausing after 7 idle days.")
+    c("Keepalive — the cadence covers the 7-day Supabase window",
+      '"17 4 */5 * *"' in ka,
+      "Every 10 days cannot protect against a 7-day pause.")
+
+    # ── OPENROUTER ──────────────────────────────────────────────────────────
+    c("Fallback chain — OpenRouter is the last link",
+      '("openrouter", openrouter_provider)' in _audit_src("engine/llm_router.py"))
+
+    return results
+
+
+print("\n" + "=" * 62)
+print("AUDIT FIXES (see WHAT_WAS_BROKEN_AND_FIXED.md)")
+print("=" * 62)
+_audit_failed = 0
+for _name, _ok, _detail in _audit_checks():
+    if _ok:
+        print(f"  ✓ {_name}")
+    else:
+        _audit_failed += 1
+        print(f"  ✗ {_name}")
+        if _detail:
+            print(f"      {_detail}")
+
+if _audit_failed:
+    print(f"\n✗ {_audit_failed} audit check(s) FAILED\n")
+    sys.exit(1)
+print("\n✓ All audit checks passed.\n")

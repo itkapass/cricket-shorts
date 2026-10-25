@@ -64,7 +64,22 @@ from engine.config import get
 
 
 # ─── YouTube API Constants ─────────────────────────────────────────────────────
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+# FIXED (Part 4.4/Part 5): the upload scope alone cannot read retention,
+# shares, or traffic sources — those live in the YouTube ANALYTICS API, which
+# needs its own read-only scope. Without it, performance_loop.py could only
+# ever see views/likes/comments and had `shares: 0` hardcoded, so the
+# feedback loop was blind to the two signals that matter most on Shorts.
+#
+# Adding it here means any token created or re-created from now on can read
+# analytics. An EXISTING token does not gain the scope retroactively — Google
+# fixes a refresh token's scopes at consent time — so an older token keeps
+# working for uploads and simply returns no analytics until it is re-issued
+# with `python -m engine.publisher --setup`. engine/youtube_analytics.py
+# treats that as a normal state, not a failure.
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/yt-analytics.readonly",
+]
 API_SERVICE = "youtube"
 API_VERSION = "v3"
 

@@ -18,7 +18,7 @@ import os
 import json
 import tempfile
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from supabase import create_client
 
 import os
@@ -77,22 +77,61 @@ def run_publish_pipeline():
     # stop the ROBOT from bursting, and a deliberate button press is not a
     # burst. Without this there was no way to say "post this one, now" short
     # of editing the database.
+    revived = _revive_retryable_failures(db)
+    if revived:
+        print(f"[publish] Returned {revived} previously-failed video(s) to the "
+              f"queue for another attempt.")
+
     forced = (
         db.table("videos").select("*")
         .eq("status", "approved").eq("publish_now", True)
-        .order("approved_at", desc=False).execute().data
+        .order("created_at", desc=False).execute().data
     ) or []
 
-    normal = (
+    # ───────────────────────────────────────────────────────────────────────
+    # BUGFIX — AUTO-APPROVED VIDEOS WERE STARVED OUT OF THE QUEUE FOREVER
+    #
+    # This used to be `.order("approved_at", desc=False).limit(publish_per_run)`.
+    # Videos auto-approved by the engine had approved_at = NULL (only the
+    # dashboard ever set it — see orchestrator._save_and_finalize's note), and
+    # PostgreSQL sorts NULLs LAST on an ascending order. With publish_per_run
+    # = 1, the single row fetched each run was always the oldest HAND-approved
+    # video, so auto-approved videos never got published at all while even one
+    # hand-approved video remained. That is a silent, permanent drop between
+    # generation and publishing.
+    #
+    # The fix does not rely on the database's NULL ordering at all: order by
+    # created_at (which is never NULL), pull a slightly wider window, then sort
+    # in Python on approved_at-or-created_at and take the oldest. This also
+    # repairs rows ALREADY in the queue with a NULL approved_at, which a
+    # forward-only fix would have left stuck.
+    # ───────────────────────────────────────────────────────────────────────
+    candidates = (
         db.table("videos")
         .select("*")
         .eq("status", "approved")
         .neq("publish_now", True)
-        .order("approved_at", desc=False)  # Oldest first
-        .limit(publish_per_run)
+        .order("created_at", desc=False)
+        .limit(max(publish_per_run * 10, 25))
         .execute()
         .data
     ) or []
+
+    def _queue_position(v):
+        return v.get("approved_at") or v.get("created_at") or ""
+
+    normal = sorted(candidates, key=_queue_position)[:publish_per_run]
+
+    # Backfill the missing timestamps we just worked around, so the queue
+    # heals itself instead of needing this workaround forever.
+    for v in normal:
+        if not v.get("approved_at"):
+            stamp = v.get("created_at") or datetime.now(timezone.utc).isoformat()
+            try:
+                db.table("videos").update({"approved_at": stamp}).eq("id", v["id"]).execute()
+                v["approved_at"] = stamp
+            except Exception:
+                pass
 
     rows = forced + normal
 
@@ -212,6 +251,12 @@ def run_publish_pipeline():
                 "youtube_url":  result["url"],
                 "channel_id":   (channel or {}).get("id"),
                 "published_at": datetime.now(timezone.utc).isoformat(),
+                # FIXED (Part 5) — "compare performance across publish time
+                # slot" was impossible because the slot was never recorded.
+                # Stored in IST, not UTC, because the audience is Indian and
+                # 17:00 UTC vs 20:00 UTC means nothing to a human reading
+                # the dashboard, while "10:30 PM" means everything.
+                "publish_slot_hour": _ist_hour_label(),
                 "publish_now":  False,   # clear the flag so it can't re-fire
                 # Same reasoning as _update_status above: no DB trigger
                 # keeps this current on UPDATE, only an insert-time default.
@@ -300,6 +345,94 @@ def _explain_error(e: Exception) -> str:
             f"doesn't expire on a schedule."
         )
     return msg
+
+
+# How many times a failed upload is retried before it is left alone. Three is
+# enough to ride out a token refresh, a quota reset and a transient 5xx
+# without ever becoming an infinite loop that burns quota on a video that is
+# genuinely broken.
+MAX_PUBLISH_ATTEMPTS = 3
+
+# Failure text that a later attempt could plausibly succeed on. A missing
+# storage file or a rejected video will never fix itself, so those are not
+# retried — retrying them would just burn the daily quota that a good video
+# needs.
+_RETRYABLE_FAILURE_MARKERS = (
+    "quota", "429", "rate limit", "resource_exhausted",
+    "500", "502", "503", "504", "internal error", "backend error",
+    "timeout", "timed out", "connection", "ssl", "temporarily",
+    "invalid_grant",        # fixed by re-auth; worth re-trying after that
+    "credentials missing",  # fixed by setting the secret
+    "daily cap",
+)
+
+
+def _ist_hour_label() -> str:
+    """The current hour in India, as 'HH:00'. Used as the publish-slot label
+    that engine/insights.py compares performance across."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%H:00")
+    except Exception:
+        # tzdata missing (Windows without the tzdata package) — fall back to
+        # a fixed +5:30 offset, which is correct year-round for IST since
+        # India observes no daylight saving.
+        return (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%H:00")
+
+
+def _revive_retryable_failures(db) -> int:
+    """Returns videos that failed to PUBLISH (not to generate) to the
+    approved queue, so a transient failure stops being permanent.
+
+    ─────────────────────────────────────────────────────────────────────────
+    THE BUG THIS FIXES (Part 4.2 — "generated count doesn't match published")
+
+    'publish_failed' and 'needs_manual' were terminal statuses. Nothing
+    anywhere — no workflow, no script, no dashboard action — ever moved a row
+    out of them. So a video whose upload hit a momentary 503, or landed while
+    the refresh token happened to be expired, was finished: fully written,
+    fully rendered, sitting in storage, and never published. Every one of
+    those is a video that was generated and not published, with no trace in
+    any count.
+
+    This retries ONLY failures whose text suggests a later attempt could
+    work, at most MAX_PUBLISH_ATTEMPTS times, and leaves genuinely broken
+    videos alone.
+    ─────────────────────────────────────────────────────────────────────────
+    """
+    try:
+        rows = (
+            db.table("videos")
+            .select("id, title, error_log, publish_attempts, storage_url")
+            .in_("status", ["publish_failed", "needs_manual"])
+            .limit(50).execute().data
+        ) or []
+    except Exception as e:
+        print(f"[publish] ⚠ Could not check for retryable failures: {e}")
+        return 0
+
+    revived = 0
+    for r in rows:
+        attempts = int(r.get("publish_attempts") or 0)
+        if attempts >= MAX_PUBLISH_ATTEMPTS:
+            continue
+        if not r.get("storage_url"):
+            continue  # the rendered file is gone; nothing to upload
+        err = (r.get("error_log") or "").lower()
+        if err and not any(m in err for m in _RETRYABLE_FAILURE_MARKERS):
+            continue  # a permanent problem — leave it for a human
+        try:
+            db.table("videos").update({
+                "status": "approved",
+                "publish_attempts": attempts + 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", r["id"]).execute()
+            print(f"[publish] ↻ Retrying '{r.get('title')}' "
+                  f"(attempt {attempts + 2} of {MAX_PUBLISH_ATTEMPTS + 1}).")
+            revived += 1
+        except Exception as e:
+            print(f"[publish] ⚠ Could not requeue video {r.get('id')}: {e}")
+    return revived
 
 
 def _update_status(db, row_id: int, status: str, error: str = None):

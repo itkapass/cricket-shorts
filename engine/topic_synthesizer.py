@@ -140,7 +140,8 @@ def _extract_json_array(text: str) -> list:
 
 
 def synthesize_topics(persona_key: str, n: int, existing_names: set, ledger: list,
-                      rotation_index: int = 0, api_key: str = None, budget=None) -> list:
+                      rotation_index: int = 0, api_key: str = None, budget=None,
+                      performance_block: str = "") -> list:
     """Asks Gemini for `n` new topic ideas inside a persona's domain.
 
     Returns [] on an ordinary failure — the caller falls back to the persona's
@@ -245,9 +246,17 @@ Invent exactly {n} new topics, one per lens, in order."""
         budget.require(1, f"topic synthesis for '{persona_key}'")
 
     try:
-        client, model_name, resolved_key = _get_client(api_key)
-        response = _call_model_with_clear_errors(client, model_name, SYNTH_SYSTEM, user, temperature=1.0,
-                                                   current_key=resolved_key)
+        client, model_name = _get_client(api_key)
+        # FIXED (Part 4.4) — real performance data now reaches topic
+        # INVENTION, not just slot planning. This module previously had no
+        # reference to video_stats, engagement_score or performance_loop
+        # anywhere in it, so a channel could discover that one kind of
+        # subject outperformed everything else and keep inventing topics as
+        # if it had learned nothing. `performance_block` is "" until there
+        # is enough measured history to say something real.
+        response = _call_model_with_clear_errors(
+            client, model_name, SYNTH_SYSTEM, user + (performance_block or ""),
+            temperature=1.0)
         if budget is not None:
             budget.spend(1)
         ideas = _extract_json_array(response.text)
@@ -427,8 +436,24 @@ def _synthesize_and_insert(persona_key: str, persona: dict, needed: int, db,
     }
 
     rotation = datetime.now(timezone.utc).timetuple().tm_yday
+
+    # What has genuinely worked on this channel, in plain English, so the
+    # next batch of topics is informed by the last batch's real results.
+    performance_block = ""
+    try:
+        from engine import insights
+        performance_block = insights.topic_bias_block(db)
+        if performance_block:
+            insights.log_decisions(db, applied_to="topic_synthesis")
+            print("[topic_synthesizer] Biasing new topics with this channel's "
+                  "measured performance (see insight_log).")
+    except Exception as e:
+        print(f"[topic_synthesizer] ⚠ Performance bias unavailable ({e}) — "
+              f"inventing topics without it, exactly as before.")
+
     ideas = synthesize_topics(persona_key, needed, all_topic_names, ledger, rotation,
-                              api_key=api_key, budget=budget)
+                              api_key=api_key, budget=budget,
+                              performance_block=performance_block)
 
     # Track how many ideas actually came from Gemini vs the static seed
     # list, and TAG THEM DIFFERENTLY. Both used to be inserted under the

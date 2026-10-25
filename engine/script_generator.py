@@ -71,7 +71,10 @@ from engine import personas as personas_mod
 # touching code. Check https://ai.google.dev/gemini-api/docs/models for the
 # current lineup and https://ai.google.dev/gemini-api/docs/deprecations
 # before assuming this default still resolves.
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+# BUGFIX: was "gemini-3.5-flash" — a name with no free tier (and, on this
+# key, possibly no existence). The default must be a model a FREE key can
+# actually call. See model_registry.FREE_TIER_PREFERRED.
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 # HTTP codes worth retrying: transient server-side conditions that usually
 # clear up within seconds (confirmed in practice — "503 UNAVAILABLE...
@@ -86,8 +89,42 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 # against the quota. Treating them the same meant a single quota error burned
 # four more calls from a budget that was already empty.
 RETRYABLE_CODES = {503, 500}
+
+# Connection-level failures, which arrive as exceptions from the HTTP layer
+# rather than as an API error code. google-genai uses httpx underneath, so
+# these are httpx types; they are imported defensively because the exact
+# module path is an implementation detail of a dependency we do not pin
+# tightly, and a missing import here must never stop the app from starting.
+#
+# ConnectionError/TimeoutError (builtins) are included because that is what
+# these surface as on some Python/httpx combinations, and OSError catches
+# the "connection reset by peer" family.
+def _transport_error_types():
+    types_found = [ConnectionError, TimeoutError, OSError]
+    try:
+        import httpx
+        types_found += [
+            httpx.RemoteProtocolError,   # "Server disconnected without sending a response"
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.PoolTimeout,
+        ]
+    except Exception:
+        pass
+    return tuple(types_found)
+
+
+_TRANSPORT_ERRORS = _transport_error_types()
 MAX_RETRIES = 4
 RETRY_BACKOFF_SECONDS = 3  # doubles each attempt: 3s, 6s, 12s, 24s
+
+
+# Set by _get_client(); read by the 429 branch of
+# _call_model_with_clear_errors when it needs to re-run model discovery.
+_active_api_key = {"key": None}
 
 
 class _ModelResponse:
@@ -109,7 +146,7 @@ class _ModelResponse:
 
 
 def _get_client(api_key: str = None):
-    """Returns (client, model_name, resolved_key).
+    """Returns (client, model_name).
 
     `api_key`, when given, overrides the global GEMINI_API_KEY. This is what
     makes per-channel Gemini keys work: each Google account gets its own
@@ -118,11 +155,6 @@ def _get_client(api_key: str = None):
     Get one free at aistudio.google.com with a different Google account, then
     set GEMINI_API_KEY_<SUFFIX> the same way YOUTUBE_CLIENT_ID_<SUFFIX>
     already works for multi-channel YouTube credentials (see docs/07).
-
-    `resolved_key` (new) is the actual key string this call ended up using —
-    returned so a caller can tell _call_model_with_clear_errors which key to
-    skip when it tries the GEMINI_API_KEY_POOL (see _gemini_key_pool below)
-    after a daily-quota 429, instead of retrying the same exhausted key.
 
     NOTE — this project previously used the `google.generativeai` package,
     which — as of testing this fix — prints: 'All support for the
@@ -142,34 +174,15 @@ def _get_client(api_key: str = None):
     # exists right now means that failure mode is gone for good.
     # Setting GEMINI_MODEL still pins a specific name and skips discovery.
     model_name = model_registry.choose_text_model(key) or DEFAULT_GEMINI_MODEL
-    return client, model_name, key
+    # Remembered so a mid-call model swap (see _call_model_with_clear_errors'
+    # 429 branch) can re-run discovery with the SAME key — per-channel keys
+    # each have their own independent quota, so using the global key there
+    # would consult the wrong account's allowance.
+    _active_api_key["key"] = key
+    return client, model_name
 
 
-def _gemini_key_pool() -> list:
-    """Extra Gemini API keys to try, in order, after the PRIMARY
-    GEMINI_API_KEY hits its own daily quota -- before giving up on Gemini
-    entirely for this call and falling through to the Groq/GitHub Models
-    backup chain.
-
-    WHY THIS EXISTS: each Google account's free Gemini key gets its own
-    independent ~20 requests/day quota (see _get_client above). This app can
-    easily use more than that for a single day's video batch once you count
-    the creative brief, the script, and the per-scene visual-relevance
-    ranking calls -- so without this, every video after roughly the 2nd or
-    3rd of the day quietly falls back to Groq, even on a day where Gemini
-    itself is working fine. One more free key (sign up again at
-    aistudio.google.com with a different Google account -- 2 minutes, no
-    cost) effectively doubles that day's Gemini budget.
-
-    Configure by setting GEMINI_API_KEY_POOL to a comma-separated list of
-    additional keys, e.g. GEMINI_API_KEY_POOL="key_two,key_three". Entirely
-    optional -- an unset/empty pool changes nothing about today's behavior.
-    """
-    raw = get("GEMINI_API_KEY_POOL", "") or ""
-    return [k.strip() for k in raw.split(",") if k.strip()]
-
-
-def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature=None, current_key=None):
+def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature=None):
     """Calls Gemini and retries transient failures.
 
     TEMPERATURE, EXPLAINED (you asked to learn real AI-engineering concepts —
@@ -197,6 +210,9 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
     """
     temperature = 0.9 if temperature is None else float(temperature)
     last_error = None
+    # One alternative-model retry per call, tracked in a dict so the inner
+    # loop can set it without a `nonlocal` declaration.
+    _model_retried = {"done": False}
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = client.models.generate_content(
@@ -269,36 +285,25 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
                     time.sleep(wait)
                     continue
 
-                # Try any additional keys in GEMINI_API_KEY_POOL before
-                # treating this as a full-stop Gemini exhaustion for the
-                # day -- see _gemini_key_pool()'s docstring. Each pooled key
-                # has its own independent daily quota, so this is what turns
-                # "every video today used Groq" into "most videos still got
-                # a genuine Gemini script" once a second free key is added.
-                pool_keys = [k for k in _gemini_key_pool() if k != current_key]
-                for pool_key in pool_keys:
-                    try:
-                        pool_client = genai.Client(api_key=pool_key)
-                        pool_resp = pool_client.models.generate_content(
-                            model=model_name, contents=user_prompt,
-                            config=types.GenerateContentConfig(
-                                system_instruction=system_prompt,
-                                response_mime_type="application/json",
-                                temperature=temperature, top_p=0.95,
-                            ),
-                        )
-                        if pool_resp.text and pool_resp.text.strip():
-                            print(f"[script_generator] A GEMINI_API_KEY_POOL key answered "
-                                  f"after the primary key's daily quota ran out -- still "
-                                  f"tagged 'gemini', not a backup provider.")
-                            return _ModelResponse(pool_resp.text, "gemini")
-                    except Exception as pool_err:
-                        print(f"[script_generator] A pooled Gemini key also failed "
-                              f"({pool_err}); trying the next one.")
+                # BUGFIX — before assuming the DAY is over, consider that
+                # this MODEL may simply have no free allowance. Google
+                # returns an identical 429 for both. Note the model as
+                # exhausted and retry once with whatever model_registry
+                # picks next; only if that also 429s do we accept that
+                # Gemini is done for today and move to the backup chain.
+                if not _model_retried.get("done"):
+                    model_registry.mark_model_exhausted(model_name)
+                    alternative = model_registry.choose_text_model(
+                        _active_api_key.get("key"), force_refresh=True)
+                    if alternative and alternative != model_name:
+                        _model_retried["done"] = True
+                        print(f"[script_generator] Gemini 429'd on '{model_name}'. That can "
+                              f"mean this model has no free tier at all, not that today's "
+                              f"allowance is gone — retrying once on '{alternative}'.")
+                        model_name = alternative
                         continue
 
-                # Genuine daily exhaustion (primary key, and every pooled
-                # GEMINI_API_KEY_POOL key, if any, are also out). Try every configured free
+                # Genuine daily exhaustion. Try every configured free
                 # backup, in order (Groq, then GitHub Models — see
                 # llm_router.py), before giving up.
                 backup_failure_detail = None
@@ -382,6 +387,55 @@ def _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt
                     f"Original error: {e}"
                 ) from e
             raise
+
+        except _TRANSPORT_ERRORS as e:
+            # ───────────────────────────────────────────────────────────────
+            # BUGFIX (Gemini "Server disconnected without sending a
+            # response"): this whole block did not exist. The only `except`
+            # here was `errors.APIError`, which covers errors the Gemini API
+            # *answered* with — 429, 503, 404. It does NOT cover the
+            # connection dying before any answer arrives.
+            #
+            # Those come out of httpx as RemoteProtocolError /
+            # ReadTimeout / ConnectError, which are NOT APIError subclasses,
+            # so they escaped the retry loop AND the Groq fallback and
+            # killed the whole video five minutes into the run. That is the
+            # exact "Server disconnected without sending a response" card
+            # sitting in the Video Queue.
+            #
+            # A dropped connection is the single most retryable failure
+            # there is, so it now gets the same treatment as a 503: retry
+            # with backoff, then fall back to the backup chain.
+            # ───────────────────────────────────────────────────────────────
+            last_error = e
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                print(f"[script_generator] \u26a0 Connection to Gemini dropped before it "
+                      f"answered ({type(e).__name__}: {e}) — attempt {attempt}/{MAX_RETRIES}. "
+                      f"This is a network blip, not a quota problem. Retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+
+            if llm_router.any_backup_available():
+                print(f"[script_generator] Gemini's connection dropped on all "
+                      f"{MAX_RETRIES} attempts. Trying configured backup providers...")
+                try:
+                    text, provider_name = llm_router.call(system_prompt, user_prompt, temperature)
+                    print(f"[script_generator] \u2713 Backup provider '{provider_name}' answered.")
+                    return _ModelResponse(text, provider_name)
+                except Exception as backup_err:
+                    raise RuntimeError(
+                        f"The connection to Gemini dropped on every attempt "
+                        f"({MAX_RETRIES} retries), and every configured backup provider "
+                        f"also failed:\n{backup_err}\n\nOriginal Gemini error: {e}"
+                    ) from backup_err
+            raise RuntimeError(
+                f"The connection to Gemini dropped on every attempt ({MAX_RETRIES} "
+                f"retries) and no backup provider is configured. This is a network "
+                f"problem, not a key or quota problem — it usually clears on its own. "
+                f"See docs/13_BACKUP_AI_PROVIDER.md to add a free Groq key so a dropped "
+                f"connection can never fail a video again.\n\nOriginal error: {e}"
+            ) from e
     raise last_error
 
 
@@ -431,7 +485,12 @@ def _looks_like_refusal(raw: str) -> bool:
 
 def _build_system_prompt(render_style: str, num_scenes: int, archetype: str = None,
                          avoid_list: str = "", structure: str = None,
-                         creative_brief: dict = None) -> str:
+                         creative_brief: dict = None, insight_block: str = "") -> str:
+    """`insight_block` is real measured guidance from this channel's own
+    published videos (engine/insights.prompt_block). It is "" until the
+    channel has enough history to say anything trustworthy, and "" must
+    behave exactly like the old prompt — see insights.py's module docstring
+    for why that matters."""
     if render_style == "character_skit":
         cast_lines = "\n".join(
             f'   - "{k}" = {v["label"]}: {v["desc"]}' for k, v in charlib.CHARACTERS.items()
@@ -580,7 +639,21 @@ def _build_system_prompt(render_style: str, num_scenes: int, archetype: str = No
     # and the JSON schema's "quiz_question" field only appears at all for
     # render_style == "sports_visual" above, so nothing here reaches or
     # confuses any other archetype/style combination in the project.
-    quiz_close_block = engagement.prompt_block(archetype) if archetype in arch.QUIZ_CLOSE_ARCHETYPES else ""
+    # ───────────────────────────────────────────────────────────────────────
+    # BUGFIX — most videos shipped with NO call to action at all.
+    #
+    # This line used to end in `else ""`, so only the two archetypes in
+    # QUIZ_CLOSE_ARCHETYPES ever got closing-CTA instructions. Every other
+    # format — the rules explainers, the myth-busts, the record videos —
+    # was given no instruction to ask for anything, and so asked for
+    # nothing. 39 published Shorts with 0 comments between them is what that
+    # looks like from outside.
+    #
+    # engagement.cta_block() now returns the full quiz mechanic for the
+    # formats built around it and a lighter, varied share/comment ask for
+    # everything else, so no video ends on a dead stop.
+    # ───────────────────────────────────────────────────────────────────────
+    quiz_close_block = engagement.cta_block(archetype)
     structure_block = (
         "\n\n" + narrative.prompt_block(structure, num_scenes) if structure else ""
     )
@@ -598,7 +671,7 @@ You are an experienced short-form video scriptwriter for YouTube Shorts. Your
 goal is genuine viewer retention: specific, well-earned writing that rewards
 someone for watching to the end — not filler, and not hollow engagement bait.
 
-{persona_voice_block}{brief_block}{archetype_block}{research_block}{quiz_close_block}{structure_block}{avoid_block}
+{persona_voice_block}{brief_block}{archetype_block}{research_block}{quiz_close_block}{insight_block}{structure_block}{avoid_block}
 
 RULES:
 1. TOTAL NARRATION: 40-50 seconds read aloud (roughly 110-140 spoken words
@@ -680,7 +753,8 @@ def generate_storyboard(topic: dict, tone: dict, num_scenes: int = 5,
                         render_style: str = "stock_footage",
                         archetype: str = None, avoid_list: str = "",
                         structure: str = None, creative_brief: dict = None,
-                        api_key: str = None, temperature: float = None) -> dict:
+                        api_key: str = None, temperature: float = None,
+                        insight_block: str = "") -> dict:
     """Generates a complete video storyboard from a topic/tone config row.
 
     `archetype` decides the KIND of video (unknown-fact, myth-bust, dark
@@ -712,6 +786,7 @@ def generate_storyboard(topic: dict, tone: dict, num_scenes: int = 5,
         creative_brief=creative_brief,
         api_key=api_key,
         temperature=temperature,
+        insight_block=insight_block,
     )
 
 
@@ -728,6 +803,7 @@ def generate_custom_storyboard(
     creative_brief: dict = None,
     api_key: str = None,
     temperature: float = None,
+    insight_block: str = "",
 ) -> dict:
     """Generates a video storyboard from any free-form prompt.
 
@@ -744,9 +820,9 @@ def generate_custom_storyboard(
     if render_style not in available_styles():
         render_style = "stock_footage"
 
-    client, model_name, resolved_key = _get_client(api_key)
+    client, model_name = _get_client(api_key)
     system_prompt = _build_system_prompt(render_style, num_scenes, archetype, avoid_list,
-                                        structure, creative_brief)
+                                        structure, creative_brief, insight_block)
     # An explicit caller-supplied temperature (usually a persona's own
     # default_temperature) wins; otherwise fall back to the global env/
     # Settings value, same as before this parameter existed.
@@ -782,8 +858,7 @@ Generate a {num_scenes}-scene storyboard adhering strictly to the JSON schema.
     used_provider = "gemini"
 
     for json_attempt in range(1, MAX_JSON_RETRIES + 1):
-        response = _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature,
-                                                   current_key=resolved_key)
+        response = _call_model_with_clear_errors(client, model_name, system_prompt, user_prompt, temperature)
         try:
             raw = response.text.strip()
             raw = re.sub(r"^```json\s*", "", raw)
@@ -999,29 +1074,18 @@ def rank_visual_candidates(scene_text: str, keyword: str, candidates: list, api_
     Called by visual_fetcher for every scene with more than one candidate. It
     exists because reviewing real output found a data-centre video illustrated
     with a derelict warehouse and a supercomputer scene illustrated with a
-    Spanish emergency-stop button -- Pexels returned loosely-matching results
+    Spanish emergency-stop button — Pexels returned loosely-matching results
     and the old code picked at RANDOM from them.
 
-    PROVIDER CHOICE, CHANGED: this used to always call Gemini, exactly like
-    the brief and the script. In practice that meant the same small ~20/day
-    Gemini quota (see _get_client's docstring) was being spent on "which
-    stock clip best fits this line" almost as often as on the actual words
-    of the video -- a typical video has several scenes that reach this
-    function, so by the time video #2 or #3 of the day needed its SCRIPT
-    written, Gemini's quota for the day was already gone and every script
-    from then on fell back to Groq, even on a day where nothing was actually
-    wrong. This ranking task is a simple, low-stakes classification job that
-    doesn't need Gemini's specific strengths, so it now tries the Groq/
-    GitHub Models backup chain FIRST (1,000 free requests/day on Groq alone
-    -- effectively unlimited for a job this size) and only falls through to
-    Gemini if no backup provider is configured at all. That keeps the
-    precious Gemini quota for the one job that actually benefits from it:
-    writing the video.
-
+    One cheap text call, no image analysis, comfortably inside the free tier.
     Returns [] on any failure so the caller keeps the original order.
     """
-    if len(candidates) < 2:
-        return candidates
+    if not candidates:
+        return []
+    try:
+        client, model_name = _get_client(api_key)
+    except Exception:
+        return []
 
     listing = "\n".join(
         f"{i}. {c.get('description') or 'untitled clip'} "
@@ -1038,31 +1102,12 @@ def rank_visual_candidates(scene_text: str, keyword: str, candidates: list, api_
     )
     user = f"NARRATION: {scene_text}\nSEARCH TERM USED: {keyword}\n\nCLIPS:\n{listing}"
 
-    def _parse_order(raw_text: str):
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip())
+    try:
+        response = _call_model_with_clear_errors(client, model_name, system, user)
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.text.strip())
         order = json.loads(raw)
         if isinstance(order, list) and all(isinstance(i, int) for i in order):
             return order
-        return []
-
-    if llm_router.any_backup_available():
-        try:
-            text, provider_name = llm_router.call(system, user, temperature=0.4)
-            order = _parse_order(text)
-            if order:
-                return order
-        except Exception as e:
-            print(f"[script_generator] Backup-provider visual ranking failed ({e}); "
-                  f"trying Gemini instead.")
-
-    try:
-        client, model_name, resolved_key = _get_client(api_key)
-    except Exception:
-        return []
-    try:
-        response = _call_model_with_clear_errors(client, model_name, system, user,
-                                                   current_key=resolved_key)
-        return _parse_order(response.text)
     except Exception as e:
         print(f"[script_generator] \u26a0 Visual ranking failed ({e}); keeping search order.")
     return []
